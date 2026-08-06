@@ -118,11 +118,62 @@ async function scenarioDistinctVoters() {
   else fail(`expected tally total ${N}, got ${json.tally.total}`);
 }
 
+// --- Shortlink clone (bounty #3) ---------------------------------------------
+// Gate: 20 concurrent /shorten of the same URL (and same alias) → exactly one
+// code wins; everyone else resolves to it; zero 5xx.
+
+async function scenarioShortlinkSameUrl() {
+  const burst = Number(process.env.SHORTEN_BURST ?? 20);
+  const url = `https://probe.example/${id('same-url')}`;
+  const results = await Promise.all(
+    Array.from({ length: burst }, () => jpost('/shorten', { url })),
+  );
+  const statuses = results.map((r) => r.status);
+  const d = dist(statuses);
+  console.log(`\n[shortlink same URL × ${burst}] status distribution: ${JSON.stringify(d)}`);
+  if (statuses.some((s) => s >= 500)) fail('shortlink same-URL burst returned a 5xx');
+  else ok('shortlink same-URL: no 5xx');
+  const codes = new Set(results.map((r) => r.json?.code).filter(Boolean));
+  if (codes.size === 1) ok(`shortlink same-URL: exactly one code (${[...codes][0]})`);
+  else fail(`shortlink same-URL: expected 1 unique code, got ${codes.size}`);
+  const code = [...codes][0];
+  if (code) {
+    const redir = await fetch(`${BASE}/${code}`, { redirect: 'manual' });
+    if (redir.status === 302 && redir.headers.get('location') === url) {
+      ok('shortlink same-URL: redirect resolves to target');
+    } else {
+      fail(`shortlink same-URL: bad redirect status=${redir.status}`);
+    }
+  }
+}
+
+async function scenarioShortlinkSameAlias() {
+  const burst = Number(process.env.SHORTEN_BURST ?? 20);
+  const alias = id('alias').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24);
+  const url = `https://probe.example/${id('same-alias')}`;
+  const results = await Promise.all(
+    Array.from({ length: burst }, () => jpost('/shorten', { url, alias })),
+  );
+  const statuses = results.map((r) => r.status);
+  const d = dist(statuses);
+  console.log(`\n[shortlink same alias × ${burst}] status distribution: ${JSON.stringify(d)}`);
+  if (statuses.some((s) => s >= 500)) fail('shortlink same-alias burst returned a 5xx');
+  else ok('shortlink same-alias: no 5xx');
+  const codes = new Set(results.map((r) => r.json?.code).filter(Boolean));
+  if (codes.size === 1 && [...codes][0] === alias) {
+    ok(`shortlink same-alias: all resolved to alias ${alias}`);
+  } else {
+    fail(`shortlink same-alias: expected only ${alias}, got ${JSON.stringify([...codes])}`);
+  }
+}
+
 console.log(`Concurrency probe → ${BASE} (burst=${N})`);
 try {
   await scenarioSameVoter();
   await scenarioIdempotentRetry();
   await scenarioDistinctVoters();
+  await scenarioShortlinkSameUrl();
+  await scenarioShortlinkSameAlias();
 } catch (e) {
   console.error(`\nprobe aborted: ${e.message}`);
   process.exit(2);
@@ -132,4 +183,4 @@ if (failures > 0) {
   console.error(`\n✗ probe FAILED with ${failures} invariant violation(s)`);
   process.exit(1);
 }
-console.log('\n✓ all invariants held — zero 5xx, tallies exact');
+console.log('\n✓ all invariants held — zero 5xx, tallies exact, shortlinks unique');

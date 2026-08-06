@@ -27,6 +27,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return json as T;
 }
 
+export type ShortLinkResult = { code: string; url: string; created: boolean };
+
 export const api = {
   clones: () => req<{ clones: Clone[] }>('/clones'),
   createPoll: (slug: string, question: string, options: string[]) =>
@@ -39,5 +41,10 @@ export const api = {
     req<{ status: string; tally: Tally }>(`/polls/${pollId}/votes`, {
       method: 'POST',
       body: JSON.stringify({ optionId, voterId, idempotencyKey }),
+    }),
+  shorten: (url: string, alias?: string) =>
+    req<ShortLinkResult>('/shorten', {
+      method: 'POST',
+      body: JSON.stringify(alias ? { url, alias } : { url }),
     }),
 };

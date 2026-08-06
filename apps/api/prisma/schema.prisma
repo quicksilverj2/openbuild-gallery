@@ -66,3 +66,18 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Shortlink clone (bounty #3).
+// Correctness under concurrent /shorten of the same URL or alias:
+//   - `url` is UNIQUE  → concurrent writers for the same URL collide; losers
+//                        re-read the winner and return the same code (no 5xx,
+//                        no duplicate codes for one URL).
+//   - `code` is UNIQUE → optional aliases are non-colliding; concurrent same
+//                        alias → one winner, rest resolve to that row.
+// Codes are random (non-enumerable); we never allocate sequential ids as codes.
+model ShortLink {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  url       String   @unique
+  createdAt DateTime @default(now())
+}

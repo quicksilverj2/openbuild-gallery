@@ -2,7 +2,7 @@
 
 A **hiring sandbox**: a small, deployed, open-source gallery of tiny working app-clones. Candidates pick a feature from the wishlist, open a PR, get a live preview + an automated review, and the strongest implementations get merged to production and credited. PR quality is the interview signal.
 
-This repo is the **v0 seed**: one clone (a **Poll**) built to the bar we grade against — correct under concurrent load, tested from a clean checkout, migrated, observable.
+This repo is the **v0 seed** plus sibling clones: a **Poll** (seed) and a **Shortlink** (bounty #3), both built to the bar we grade against — correct under concurrent load, tested from a clean checkout, migrated, observable.
 
 ## Why the Poll clone looks the way it does
 
@@ -17,8 +17,8 @@ The live probe (`probes/concurrency.mjs`) fires 50 concurrent votes and asserts 
 ## Layout
 
 ```
-apps/api        Fastify + Prisma + Postgres. The Poll clone + the vote gate.
-probes          concurrency.mjs (the live gate) + wait-ready.sh
+apps/api        Fastify + Prisma + Postgres. Poll + Shortlink clones and their gates.
+probes          concurrency.mjs (live gate for poll + shortlink) + wait-ready.sh
 .github         pr-checks.yml — green-from-clean-checkout + the live probe
 ```
 
