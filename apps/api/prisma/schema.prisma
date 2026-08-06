@@ -66,3 +66,17 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Shortlink clone: URL shortener with dedup and non-enumerable codes.
+// Design notes:
+//   - code is the primary key — auto-generated (8-char random) or explicit alias.
+//   - @@unique([url]) ensures one row per URL (dedup invariant).
+//   - concurrent /shorten of the same URL: first writer wins, others resolve to the
+//     same code via the unique violation → lookup path (zero 5xx).
+model Shortlink {
+  code      String   @id
+  url       String
+  createdAt DateTime @default(now())
+
+  @@unique([url])
+}

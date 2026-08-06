@@ -45,6 +45,12 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+// --- Shortlink schemas ---
+const shortenBody = z.object({
+  url: z.string().url(),
+  alias: z.string().min(1).max(32).optional(),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -69,10 +75,11 @@ export function buildApp(): FastifyInstance {
 
   // Minimal Prometheus-style metrics: enough for the observability bounty to build on.
   app.get('/metrics', async (_req, reply) => {
-    const [clones, polls, votes] = await Promise.all([
+    const [clones, polls, votes, shortlinks] = await Promise.all([
       prisma.clone.count(),
       prisma.poll.count(),
       prisma.vote.count(),
+      prisma.shortlink.count(),
     ]);
     reply.header('content-type', 'text/plain; version=0.0.4');
     return [
@@ -85,8 +92,71 @@ export function buildApp(): FastifyInstance {
       '# HELP openbuild_votes_total Number of votes recorded.',
       '# TYPE openbuild_votes_total counter',
       `openbuild_votes_total ${votes}`,
+      '# HELP openbuild_shortlinks_total Number of shortlinks created.',
+      '# TYPE openbuild_shortlinks_total counter',
+      `openbuild_shortlinks_total ${shortlinks}`,
       '',
     ].join('\n');
+  });
+
+  // Shortlink clone: POST /shorten → {code, url}, deduplicate on concurrent writes.
+  app.post('/shorten', async (req, reply) => {
+    const body = shortenBody.parse(req.body);
+
+    // If alias requested, try to claim it first.
+    if (body.alias) {
+      const code = body.alias;
+      try {
+        await prisma.shortlink.create({ data: { code, url: body.url } });
+        req.log.info({ event: 'shortlink.created', code, url: body.url }, 'shortlink created (alias)');
+        return reply.code(201).send({ code, url: body.url });
+      } catch (e) {
+        if (!isUniqueViolation(e)) throw e;
+        // Alias taken — check if it's for the same URL (idempotent) or a different URL (conflict).
+        const existing = await prisma.shortlink.findUnique({ where: { code } });
+        if (existing && existing.url === body.url) {
+          req.log.info({ event: 'shortlink.idempotent', code }, 'alias already points to same URL');
+          return reply.code(200).send({ code, url: body.url });
+        }
+        return reply.code(409).send({ error: 'alias_taken' });
+      }
+    }
+
+    // No alias — generate a random code, dedup on URL.
+    // First check if this URL already has a shortlink.
+    const existing = await prisma.shortlink.findUnique({ where: { url: body.url } });
+    if (existing) {
+      return reply.code(200).send({ code: existing.code, url: body.url });
+    }
+
+    // Generate a new code and insert. On unique violation (URL or code collision),
+    // retry: URL collision → resolve to existing; code collision → generate new code.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const code = randomCode();
+      try {
+        await prisma.shortlink.create({ data: { code, url: body.url } });
+        req.log.info({ event: 'shortlink.created', code, url: body.url }, 'shortlink created');
+        return reply.code(201).send({ code, url: body.url });
+      } catch (e) {
+        if (!isUniqueViolation(e)) throw e;
+        // Unique violation — either URL already exists (concurrent writer won) or code collision.
+        const dup = await prisma.shortlink.findUnique({ where: { url: body.url } });
+        if (dup) {
+          return reply.code(200).send({ code: dup.code, url: body.url });
+        }
+        // Pure code collision — retry with a new code.
+        req.log.warn({ event: 'shortlink.code_collision', attempt }, 'code collision, retrying');
+      }
+    }
+    return reply.code(500).send({ error: 'could_not_generate_unique_code' });
+  });
+
+  // Shortlink redirect: GET /s/:code → 302 to stored URL.
+  app.get('/s/:code', async (req, reply) => {
+    const { code } = z.object({ code: z.string().min(1) }).parse(req.params);
+    const link = await prisma.shortlink.findUnique({ where: { code } });
+    if (!link) return reply.code(404).send({ error: 'shortlink_not_found' });
+    return reply.redirect(link.url, 302);
   });
 
   app.get('/clones', async () => {
@@ -202,4 +272,12 @@ export function buildApp(): FastifyInstance {
 
 function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+/** Generate a short, non-enumerable random code (8 chars, alphanumeric). */
+function randomCode(): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let s = '';
+  for (let i = 0; i < 8; i++) s += chars[(Math.random() * chars.length) | 0];
+  return s;
 }
