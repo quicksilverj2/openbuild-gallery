@@ -6,3 +6,5 @@
   concurrent burst — one vote per voter, idempotent retries, zero 5xx under race.
 - **The gate:** invariant test suite + a re-runnable live concurrency probe
   (`probes/concurrency.mjs`), wired into CI (green-from-clean-checkout + live probe).
+
+<!-- reviewer-bot smoke test -->
