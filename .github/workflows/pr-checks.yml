@@ -58,12 +58,30 @@ jobs:
           pnpm --filter api start &
           SERVER_PID=$!
           bash probes/wait-ready.sh http://localhost:3000/readyz 60
-          node probes/concurrency.mjs http://localhost:3000
-          STATUS=$?
+          set +e
+          node probes/concurrency.mjs http://localhost:3000 | tee probe-output.txt
+          STATUS=${PIPESTATUS[0]}
           kill "$SERVER_PID" 2>/dev/null || true
-          exit $STATUS
+          exit "$STATUS"
         # concurrency.mjs exits NON-ZERO if the invariant breaks (double-vote, lost
-        # update, or any 5xx under the burst).
+        # update, or any 5xx under the burst). Output is captured for the reviewer bot.
+
+      # Hand the probe output + PR number to the reviewer bot (which runs in a
+      # separate, trusted workflow_run context and never touches the PR code).
+      - name: Stage reviewer-bot artifact
+        if: always()
+        run: |
+          touch probe-output.txt
+          echo "${{ github.event.pull_request.number }}" > pr-number.txt
+      - name: Upload reviewer-bot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review
+          path: |
+            probe-output.txt
+            pr-number.txt
+          retention-days: 3
 
   # Web app builds from a clean checkout (catches RSC/client-boundary + type errors
   # that a bare typecheck can miss). No DB needed — the gallery fetches at runtime.

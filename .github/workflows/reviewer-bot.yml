@@ -1,0 +1,102 @@
+# Automated reviewer (v0, thin) — runs the take-home bar against every PR.
+#
+# SECURITY: triggered by `workflow_run`, so it runs in the BASE repo context (trusted),
+# NOT in the PR's context. It never checks out or executes the PR's code — the untrusted
+# code already ran in `pr-checks` with a read-only token and no secrets. This job only
+# reads the results artifact and posts a comment. That's why it can safely hold
+# `pull-requests: write` even for fork PRs.
+#
+# It comments and scores. It NEVER merges — you do, only from main.
+name: reviewer-bot
+on:
+  workflow_run:
+    workflows: ['pr-checks']
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  actions: read
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Download results artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pr-review
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post structured review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- openbuild-reviewer-bot -->';
+            const run = context.payload.workflow_run;
+            const ciPassed = run.conclusion === 'success';
+
+            const read = (f) => {
+              try { return fs.readFileSync(f, 'utf8').trim(); } catch { return ''; }
+            };
+            const prNumber = Number(read('pr-number.txt'));
+            const probe = read('probe-output.txt');
+            if (!prNumber) {
+              core.info('No PR number in artifact; nothing to comment on.');
+              return;
+            }
+
+            const probeGreen = /all invariants held/.test(probe);
+            const runUrl = run.html_url;
+
+            let verdict, gloss;
+            if (ciPassed && probeGreen) {
+              verdict = '✅ **merge-candidate**';
+              gloss =
+                'CI is green from a clean checkout **and** the live concurrency probe held with zero 5xx. ' +
+                'Pending your review (and tournament ranking if this bounty is contested).';
+            } else if (!ciPassed && probe && !probeGreen) {
+              verdict = '🔧 **needs-work**';
+              gloss = 'The live concurrency probe reproduced a failure under load — see the distribution below.';
+            } else {
+              verdict = '🔧 **needs-work**';
+              gloss = 'A required check is red. See the run for the failing step.';
+            }
+
+            const probeBlock = probe
+              ? `\n<details><summary>Live concurrency probe output</summary>\n\n\`\`\`\n${probe}\n\`\`\`\n</details>\n`
+              : '\n_Probe did not run (an earlier gate failed)._\n';
+
+            const body = [
+              MARKER,
+              '### 🤖 Automated review',
+              '',
+              `${verdict} — ${gloss}`,
+              '',
+              '| Gate | Result |',
+              '| --- | --- |',
+              `| CI (build · lint · typecheck · whole suite · migrations) | ${ciPassed ? '✅ pass' : '❌ fail'} |`,
+              `| Live concurrency probe (zero 5xx, invariant holds) | ${probeGreen ? '✅ pass' : (probe ? '❌ fail' : '⚠️ did not run')} |`,
+              probeBlock,
+              `[Full CI run](${runUrl})`,
+              '',
+              '<sub>Advisory only — this bot never merges. The maintainer makes the merge/hire call. '
+                + 'Verdict mapping: merged = strong signal · clean-but-not-merged = interview-worthy · red/over-claimed = reject.</sub>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              core.info(`Updated review comment on #${prNumber}`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              core.info(`Created review comment on #${prNumber}`);
+            }
