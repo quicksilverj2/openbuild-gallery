@@ -65,6 +65,18 @@ jobs:
         # concurrency.mjs exits NON-ZERO if the invariant breaks (double-vote, lost
         # update, or any 5xx under the burst).
 
+  # Web app builds from a clean checkout (catches RSC/client-boundary + type errors
+  # that a bare typecheck can miss). No DB needed — the gallery fetches at runtime.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter web build
+
   # The reviewer bot (separate workflow, bot identity, least-privilege token) reads
   # these results + the PR's preview URL, re-probes the live preview, scores against
   # the rubric, and comments. It never merges — you do, only from main.
