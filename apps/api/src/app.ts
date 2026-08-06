@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from './db';
@@ -54,6 +55,13 @@ export function buildApp(): FastifyInstance {
       redact: ['req.headers.authorization'],
     },
     genReqId: (req) => (req.headers['x-request-id'] as string) ?? cryptoRandomId(),
+  });
+
+  // The gallery is a static site on a different origin, so it calls this API
+  // cross-origin. Reflect the configured origin(s), or any origin for the open
+  // sandbox (no cookies/credentials are used, so reflect-any is safe here).
+  app.register(cors, {
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
   });
 
   app.get('/healthz', async () => ({ status: 'ok' }));

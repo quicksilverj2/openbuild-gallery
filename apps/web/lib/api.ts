@@ -1,6 +1,13 @@
 // Thin client for the OpenBuild Gallery API. Base URL is inlined at build time
-// from NEXT_PUBLIC_API_URL (falls back to the local api on :3000).
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000';
+// from NEXT_PUBLIC_API_URL (falls back to the local api on :3000). Render's
+// fromService yields a bare hostname, so prepend https:// when no scheme is present.
+function normalizeBase(raw: string): string {
+  const v = raw.trim().replace(/\/$/, '');
+  if (!v) return 'http://localhost:3000';
+  return /^https?:\/\//.test(v) ? v : `https://${v}`;
+}
+
+export const API_BASE = normalizeBase(process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000');
 
 export type Clone = {
   slug: string;

@@ -1,0 +1,54 @@
+# Render Blueprint — the whole platform on one host.
+#   • openbuild-web : Static Site (apps/web) — the gallery. Always-on, free, no cold start.
+#   • openbuild-api : Web Service (apps/api) — Fastify. Migrates on deploy; free tier sleeps when idle.
+#   • DB            : your Neon Postgres (external) — paste its pooled connection string into the
+#                     `DATABASE_URL` env var in the Render dashboard (sync:false = never in git).
+#
+# Connect once: Render → New → Blueprint → pick quicksilverj2/openbuild-gallery.
+# Render reads this file and creates both services together.
+services:
+  - type: web
+    name: openbuild-api
+    runtime: node
+    plan: free
+    rootDir: .
+    healthCheckPath: /healthz
+    # migrate + seed run at build (Render injects env vars during build); start is just the server.
+    buildCommand: >-
+      corepack enable &&
+      pnpm install --frozen-lockfile &&
+      pnpm --filter api exec prisma generate &&
+      pnpm --filter api exec prisma migrate deploy &&
+      pnpm --filter api exec prisma db seed
+    startCommand: pnpm --filter api start
+    autoDeploy: true
+    previewsEnabled: true
+    envVars:
+      - key: DATABASE_URL # paste your Neon pooled connection string here (dashboard)
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      # CORS is left as reflect-any in the app (no cookies/credentials), so the
+      # gallery origin works without threading a scheme-qualified URL through here.
+
+  - type: web
+    name: openbuild-web
+    runtime: static
+    rootDir: .
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter web build
+    staticPublishPath: apps/web/out
+    autoDeploy: true
+    previewsEnabled: true
+    envVars:
+      # Base URL of the API, inlined into the static build. fromService yields a bare
+      # hostname; lib/api.ts prepends https:// when the scheme is missing.
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: openbuild-api
+          property: host
+
+# NOTE on per-PR previews: previewsEnabled spins up preview services per PR, but they
+# share this one Neon DB. True per-PR DB isolation = a Neon branch per preview (bounty #9).

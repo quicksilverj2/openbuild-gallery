@@ -18,6 +18,7 @@
     "seed": "prisma db seed"
   },
   "dependencies": {
+    "@fastify/cors": "^10.0.1",
     "@prisma/client": "^6.2.1",
     "fastify": "^5.2.0",
     "zod": "^3.24.1"
