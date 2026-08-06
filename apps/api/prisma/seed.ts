@@ -16,6 +16,18 @@ async function main() {
     },
   });
   console.log('seeded clone: poll');
+
+  await prisma.clone.upsert({
+    where: { slug: 'voucher' },
+    update: {},
+    create: {
+      slug: 'voucher',
+      title: 'Voucher',
+      summary: 'Create and redeem single-use vouchers. Atomic redemption under concurrent load — exactly once, zero 5xx.',
+      demoPath: '/clones/voucher',
+    },
+  });
+  console.log('seeded clone: voucher');
 }
 
 main()

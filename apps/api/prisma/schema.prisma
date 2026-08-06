@@ -66,3 +66,19 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Voucher clone: single-use redemption with atomic claim guarantee.
+// Design notes (concurrency-under-load):
+//   - code is the primary key — explicit human-readable voucher code.
+//   - redeemedBy starts NULL and is atomically set by the redeem endpoint using
+//     UPDATE ... WHERE "redeemedBy" IS NULL ... RETURNING *.
+//   - If a concurrent redeemer already claimed the row, RETURNING produces an
+//     empty set → clean 409, zero 5xx.
+//   - redeemedAt records the moment of redemption for audit.
+model Voucher {
+  code       String    @id
+  value      String
+  redeemedBy String?
+  redeemedAt DateTime?
+  createdAt  DateTime  @default(now())
+}

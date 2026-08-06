@@ -45,6 +45,15 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const createVoucherBody = z.object({
+  code: z.string().min(1).max(64),
+  value: z.string().min(1),
+});
+
+const redeemVoucherBody = z.object({
+  userId: z.string().min(1),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -69,10 +78,11 @@ export function buildApp(): FastifyInstance {
 
   // Minimal Prometheus-style metrics: enough for the observability bounty to build on.
   app.get('/metrics', async (_req, reply) => {
-    const [clones, polls, votes] = await Promise.all([
+    const [clones, polls, votes, vouchers] = await Promise.all([
       prisma.clone.count(),
       prisma.poll.count(),
       prisma.vote.count(),
+      prisma.voucher.count(),
     ]);
     reply.header('content-type', 'text/plain; version=0.0.4');
     return [
@@ -85,6 +95,9 @@ export function buildApp(): FastifyInstance {
       '# HELP openbuild_votes_total Number of votes recorded.',
       '# TYPE openbuild_votes_total counter',
       `openbuild_votes_total ${votes}`,
+      '# HELP openbuild_vouchers_total Number of vouchers created.',
+      '# TYPE openbuild_vouchers_total counter',
+      `openbuild_vouchers_total ${vouchers}`,
       '',
     ].join('\n');
   });
@@ -186,6 +199,81 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  // Voucher clone: single-use redemption, exactly-once under concurrency.
+  // POST /voucher — create a new voucher code with a value.
+  app.post('/voucher', async (req, reply) => {
+    const body = createVoucherBody.parse(req.body);
+
+    const voucher = await prisma.voucher.create({
+      data: { code: body.code, value: body.value },
+    });
+
+    req.log.info(
+      { event: 'voucher.created', code: voucher.code, value: voucher.value },
+      'voucher created',
+    );
+
+    return reply.code(201).send({
+      code: voucher.code,
+      value: voucher.value,
+      redeemedBy: voucher.redeemedBy,
+      redeemedAt: voucher.redeemedAt?.toISOString() ?? null,
+      createdAt: voucher.createdAt.toISOString(),
+    });
+  });
+
+  // POST /voucher/:code/redeem — atomically claim a voucher.
+  // Uses UPDATE ... WHERE "redeemedBy" IS NULL ... RETURNING * so Postgres
+  // serialises concurrent claimants on the row lock. If the RETURNING set is
+  // empty the voucher was already redeemed (409) or doesn't exist (404).
+  app.post('/voucher/:code/redeem', async (req, reply) => {
+    const { code } = z.object({ code: z.string().min(1) }).parse(req.params);
+    const body = redeemVoucherBody.parse(req.body);
+
+    const rows: Array<{
+      code: string;
+      value: string;
+      redeemedBy: string | null;
+      redeemedAt: Date | null;
+      createdAt: Date;
+    }> = await prisma.$queryRaw`
+      UPDATE "Voucher"
+      SET "redeemedBy" = ${body.userId}, "redeemedAt" = NOW()
+      WHERE "code" = ${code}
+        AND "redeemedBy" IS NULL
+      RETURNING *
+    `;
+
+    if (rows.length === 0) {
+      // Either the voucher doesn't exist or it's already redeemed.
+      const voucher = await prisma.voucher.findUnique({ where: { code } });
+
+      if (!voucher) {
+        return reply.code(404).send({ error: 'voucher_not_found' });
+      }
+
+      req.log.info(
+        { event: 'voucher.already_redeemed', code, redeemedBy: voucher.redeemedBy },
+        'voucher already redeemed',
+      );
+      return reply.code(409).send({ error: 'already_redeemed' });
+    }
+
+    const voucher = rows[0]!; // safe: rows.length > 0 after early return
+    req.log.info(
+      { event: 'voucher.redeemed', code: voucher.code, redeemedBy: voucher.redeemedBy },
+      'voucher redeemed',
+    );
+
+    return reply.code(200).send({
+      code: voucher.code,
+      value: voucher.value,
+      redeemedBy: voucher.redeemedBy,
+      redeemedAt: voucher.redeemedAt?.toISOString() ?? null,
+      createdAt: voucher.createdAt.toISOString(),
+    });
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
