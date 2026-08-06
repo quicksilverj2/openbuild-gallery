@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { api, type Clone } from '@/lib/api';
+import { isNew, markSeen } from '@/lib/seen';
 
 export default function Home() {
   const [clones, setClones] = useState<Clone[]>([]);
@@ -16,6 +17,11 @@ export default function Home() {
       .finally(() => setLoading(false));
   }, []);
 
+  /** Whether a clone is new since the viewer's last visit. */
+  function isNewClone(clone: Clone): boolean {
+    return isNew(clone.slug);
+  }
+
   return (
     <main>
       <header className="masthead">
@@ -29,14 +35,23 @@ export default function Home() {
         {loading && <p className="muted">Loading clones…</p>}
         {error && (
           <p className="muted">
-            Couldn’t reach the API ({error}). Check that it’s running and that{' '}
+            Couldn&apos;t reach the API ({error}). Check that it&apos;s running and that{' '}
             <code>NEXT_PUBLIC_API_URL</code> points at it.
           </p>
         )}
         {clones.map((c) => (
-          <a key={c.slug} className="card" href={c.demoPath}>
-            <h3>{c.title}</h3>
+          <a
+            key={c.slug}
+            className="card"
+            href={c.demoPath}
+            onClick={() => markSeen(c.slug)}
+          >
+            <div className="card-header">
+              <h3>{c.title}</h3>
+              {isNewClone(c) && <span className="badge-new">New</span>}
+            </div>
             <p>{c.summary}</p>
+            <span className="card-author">by {c.createdBy}</span>
           </a>
         ))}
         {!loading && !error && clones.length === 0 && (
