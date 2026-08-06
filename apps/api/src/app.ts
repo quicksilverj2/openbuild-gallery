@@ -45,6 +45,13 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+// --- Paste schemas ---
+const createPasteBody = z.object({
+  content: z.string().min(1),
+  viewsAllowed: z.number().int().min(1).default(1),
+  ttlSeconds: z.number().int().min(1).max(86400).default(3600),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -69,10 +76,11 @@ export function buildApp(): FastifyInstance {
 
   // Minimal Prometheus-style metrics: enough for the observability bounty to build on.
   app.get('/metrics', async (_req, reply) => {
-    const [clones, polls, votes] = await Promise.all([
+    const [clones, polls, votes, pastes] = await Promise.all([
       prisma.clone.count(),
       prisma.poll.count(),
       prisma.vote.count(),
+      prisma.paste.count(),
     ]);
     reply.header('content-type', 'text/plain; version=0.0.4');
     return [
@@ -85,8 +93,100 @@ export function buildApp(): FastifyInstance {
       '# HELP openbuild_votes_total Number of votes recorded.',
       '# TYPE openbuild_votes_total counter',
       `openbuild_votes_total ${votes}`,
+      '# HELP openbuild_pastes_total Number of pastes created.',
+      '# TYPE openbuild_pastes_total counter',
+      `openbuild_pastes_total ${pastes}`,
       '',
     ].join('\n');
+  });
+
+  // Paste clone: POST /paste → create a paste with TTL and view limit.
+  app.post('/paste', async (req, reply) => {
+    const body = createPasteBody.parse(req.body);
+    const expiresAt = new Date(Date.now() + body.ttlSeconds * 1000);
+
+    const paste = await prisma.paste.create({
+      data: {
+        content: body.content,
+        viewsAllowed: body.viewsAllowed,
+        ttlSeconds: body.ttlSeconds,
+        expiresAt,
+      },
+    });
+
+    req.log.info(
+      { event: 'paste.created', pasteId: paste.id, viewsAllowed: body.viewsAllowed, ttlSeconds: body.ttlSeconds },
+      'paste created',
+    );
+
+    return reply.code(201).send({
+      id: paste.id,
+      viewsAllowed: paste.viewsAllowed,
+      viewsUsed: paste.viewsUsed,
+      ttlSeconds: paste.ttlSeconds,
+      createdAt: paste.createdAt.toISOString(),
+      expiresAt: paste.expiresAt.toISOString(),
+    });
+  });
+
+  // Paste read: GET /paste/:id → return content (atomically decrement views).
+  // Uses UPDATE ... RETURNING * with a WHERE clause that Postgres evaluates
+  // atomically on the locked row — if the row was already exhausted by a
+  // concurrent reader the RETURNING set is empty → clean 404.
+  app.get('/paste/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string().min(1) }).parse(req.params);
+
+    const rows: Array<{
+      id: string;
+      content: string;
+      viewsAllowed: number;
+      viewsUsed: number;
+      ttlSeconds: number;
+      createdAt: Date;
+      expiresAt: Date;
+    }> = await prisma.$queryRaw`
+      UPDATE "Paste"
+      SET "viewsUsed" = "viewsUsed" + 1
+      WHERE "id" = ${id}
+        AND "viewsUsed" < "viewsAllowed"
+        AND "expiresAt" > NOW()
+      RETURNING *
+    `;
+
+    if (rows.length === 0) {
+      // Row either doesn't exist, is expired, or views exhausted.
+      // Check which case it is so we can return the right code.
+      const paste = await prisma.paste.findUnique({ where: { id } });
+
+      if (!paste) {
+        return reply.code(404).send({ error: 'paste_not_found' });
+      }
+
+      if (paste.viewsUsed >= paste.viewsAllowed) {
+        req.log.info({ event: 'paste.exhausted', pasteId: id }, 'paste views exhausted');
+        return reply.code(410).send({ error: 'paste_exhausted' });
+      }
+
+      // Must be expired
+      req.log.info({ event: 'paste.expired', pasteId: id }, 'paste expired');
+      return reply.code(410).send({ error: 'paste_expired' });
+    }
+
+    const paste = rows[0]!; // safe: rows.length > 0 after the early-return above
+    req.log.info(
+      { event: 'paste.read', pasteId: paste.id, viewsUsed: paste.viewsUsed, viewsAllowed: paste.viewsAllowed },
+      'paste read',
+    );
+
+    return reply.code(200).send({
+      id: paste.id,
+      content: paste.content,
+      viewsAllowed: paste.viewsAllowed,
+      viewsUsed: paste.viewsUsed,
+      ttlSeconds: paste.ttlSeconds,
+      createdAt: paste.createdAt.toISOString(),
+      expiresAt: paste.expiresAt.toISOString(),
+    });
   });
 
   app.get('/clones', async () => {
