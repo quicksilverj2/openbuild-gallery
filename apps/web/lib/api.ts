@@ -14,6 +14,8 @@ export type Clone = {
   title: string;
   summary: string;
   demoPath: string;
+  createdBy: string;
+  createdAt: string;
 };
 
 export type PollOption = { id: string; text: string; votes?: number };
