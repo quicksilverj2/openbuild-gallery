@@ -16,6 +16,30 @@ async function main() {
     },
   });
   console.log('seeded clone: poll');
+
+  await prisma.clone.upsert({
+    where: { slug: 'shortlink' },
+    update: {},
+    create: {
+      slug: 'shortlink',
+      title: 'Shortlink',
+      summary: 'Shorten any URL, get a non-enumerable code. Deduplicates identical URLs. Correct under concurrent load.',
+      demoPath: '/clones/shortlink',
+    },
+  });
+  console.log('seeded clone: shortlink');
+
+  await prisma.clone.upsert({
+    where: { slug: 'paste' },
+    update: {},
+    create: {
+      slug: 'paste',
+      title: 'Paste',
+      summary: 'Create a view-once or N-view paste with TTL. Atomic view counting under concurrent load.',
+      demoPath: '/clones/paste',
+    },
+  });
+  console.log('seeded clone: paste');
 }
 
 main()

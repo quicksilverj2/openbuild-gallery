@@ -66,3 +66,36 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Shortlink clone: URL shortener with dedup and non-enumerable codes.
+// Design notes:
+//   - code is the primary key — auto-generated (8-char random) or explicit alias.
+//   - @@unique([url]) ensures one row per URL (dedup invariant).
+//   - concurrent /shorten of the same URL: first writer wins, others resolve to the
+//     same code via the unique violation → lookup path (zero 5xx).
+model Shortlink {
+  code      String   @id
+  url       String
+  createdAt DateTime @default(now())
+
+  @@unique([url])
+}
+
+// Paste clone: view-once or N-view paste with TTL.
+// Design notes (concurrency-under-load):
+//   - viewsAllowed and viewsUsed are separate columns so Postgres can atomically
+//     evaluate `viewsUsed < viewsAllowed` inside a single-row UPDATE … WHERE.
+//   - The read endpoint uses UPDATE … RETURNING * with that WHERE clause.
+//     If the row was already exhausted by a concurrent reader the RETURNING set
+//     is empty → clean 404/410, zero 5xx.
+//   - expiresAt is a concrete timestamp (createdAt + ttlSeconds) so the DB can
+//     filter expired pastes without client-side math.
+model Paste {
+  id           String   @id @default(cuid())
+  content      String
+  viewsAllowed Int
+  viewsUsed    Int      @default(0)
+  ttlSeconds   Int
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+}
