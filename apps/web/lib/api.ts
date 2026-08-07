@@ -14,11 +14,26 @@ export type Clone = {
   title: string;
   summary: string;
   demoPath: string;
+  createdBy: string;
+  createdAt: string;
 };
 
 export type PollOption = { id: string; text: string; votes?: number };
 export type Tally = { total: number; options: Required<PollOption>[] };
 export type Poll = { id: string; question: string; options?: PollOption[]; tally?: Tally };
+
+export type Paste = {
+  id: string;
+  viewsAllowed: number;
+  viewsRemaining: number;
+  expiresAt: string;
+};
+
+export type PasteContent = {
+  id: string;
+  content: string;
+  viewsRemaining: number;
+};
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -47,4 +62,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ optionId, voterId, idempotencyKey }),
     }),
+  createPaste: (slug: string, content: string, viewsAllowed: number, ttlSeconds: number) =>
+    req<Paste>(`/clones/${slug}/pastes`, {
+      method: 'POST',
+      body: JSON.stringify({ content, viewsAllowed, ttlSeconds }),
+    }),
+  readPaste: (id: string) => req<PasteContent>(`/pastes/${id}`),
 };
