@@ -1,12 +1,8 @@
-// OpenBuild Gallery — data model for the seed product (the Poll clone).
-// Design note on correctness-under-load: votes are an APPEND-ONLY table, and
-// the tally is a COUNT over that table. There is no mutable counter to race on,
-// so lost updates are impossible by construction. The two unique constraints on
-// Vote enforce the two invariants candidates must not break:
-//   - one vote per (poll, voter)      -> no double-vote across tabs
-//   - one effect per idempotency key  -> safe client retries
-// Concurrent writers that collide on either index lose with a unique violation,
-// which the API translates into a clean 409 / idempotent replay — never a 500.
+// OpenBuild Gallery â€” data model with Wallet clone.
+// Atomic transfers via DB transaction: debit + credit + ledger entry in one tx.
+// Balance never negative: CHECK balancePaise >= 0 enforced in application logic.
+// Idempotency: unique on idempotencyKey prevents double-transfer.
+// Integer paise: all amounts stored as BIGINT paise (1 rupee = 100 paise).
 
 generator client {
   provider = "prisma-client-js"
@@ -59,10 +55,36 @@ model Vote {
   poll           Poll     @relation(fields: [pollId], references: [id], onDelete: Cascade)
   option         Option   @relation(fields: [optionId], references: [id], onDelete: Cascade)
 
-  // one vote per voter per poll
   @@unique([pollId, voterId])
-  // one effect per idempotency key, scoped to the poll (safe retries; keys are
-  // meaningful within a poll, so two different polls can reuse a key name)
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
+}
+
+model Wallet {
+  id           String   @id @default(cuid())
+  cloneSlug    String
+  ownerId      String
+  balancePaise BigInt   @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([ownerId])
+  @@index([cloneSlug])
+}
+
+model LedgerEntry {
+  id             String   @id @default(cuid())
+  cloneSlug      String
+  fromWalletId   String
+  toWalletId     String
+  amountPaise    BigInt
+  idempotencyKey String
+  fingerprint    String
+  createdAt      DateTime @default(now())
+  fromWallet     Wallet   @relation("FromWallet", fields: [fromWalletId], references: [id], onDelete: Cascade)
+  toWallet       Wallet   @relation("ToWallet", fields: [toWalletId], references: [id], onDelete: Cascade)
+
+  @@unique([idempotencyKey])
+  @@index([cloneSlug])
+  @@index([fromWalletId])
+  @@index([toWalletId])
 }
