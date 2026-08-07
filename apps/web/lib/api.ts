@@ -1,6 +1,4 @@
-// Thin client for the OpenBuild Gallery API. Base URL is inlined at build time
-// from NEXT_PUBLIC_API_URL (falls back to the local api on :3000). Render's
-// fromService yields a bare hostname, so prepend https:// when no scheme is present.
+// Thin client for the OpenBuild Gallery API.
 function normalizeBase(raw: string): string {
   const v = raw.trim().replace(/\/$/, '');
   if (!v) return 'http://localhost:3000';
@@ -14,11 +12,15 @@ export type Clone = {
   title: string;
   summary: string;
   demoPath: string;
+  createdBy: string;
+  createdAt: string;
 };
 
 export type PollOption = { id: string; text: string; votes?: number };
 export type Tally = { total: number; options: Required<PollOption>[] };
 export type Poll = { id: string; question: string; options?: PollOption[]; tally?: Tally };
+
+export type Voucher = { id: string; code: string };
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -46,5 +48,15 @@ export const api = {
     req<{ status: string; tally: Tally }>(`/polls/${pollId}/votes`, {
       method: 'POST',
       body: JSON.stringify({ optionId, voterId, idempotencyKey }),
+    }),
+  createVoucher: (slug: string, code: string) =>
+    req<Voucher>(`/clones/${slug}/vouchers`, {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+  redeemVoucher: (voucherId: string, userId: string) =>
+    req<{ status: string; voucherId: string }>(`/vouchers/${voucherId}/redeem`, {
+      method: 'POST',
+      body: JSON.stringify({ userId }),
     }),
 };
