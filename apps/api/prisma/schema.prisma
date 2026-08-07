@@ -1,12 +1,6 @@
-// OpenBuild Gallery — data model for the seed product (the Poll clone).
-// Design note on correctness-under-load: votes are an APPEND-ONLY table, and
-// the tally is a COUNT over that table. There is no mutable counter to race on,
-// so lost updates are impossible by construction. The two unique constraints on
-// Vote enforce the two invariants candidates must not break:
-//   - one vote per (poll, voter)      -> no double-vote across tabs
-//   - one effect per idempotency key  -> safe client retries
-// Concurrent writers that collide on either index lose with a unique violation,
-// which the API translates into a clean 409 / idempotent replay — never a 500.
+// OpenBuild Gallery â€” data model with Shortlink clone.
+// Design: URL unique index ensures dedup. Code unique index ensures no collisions.
+// Alias unique index (nullable) ensures custom aliases don't clash.
 
 generator client {
   provider = "prisma-client-js"
@@ -59,10 +53,21 @@ model Vote {
   poll           Poll     @relation(fields: [pollId], references: [id], onDelete: Cascade)
   option         Option   @relation(fields: [optionId], references: [id], onDelete: Cascade)
 
-  // one vote per voter per poll
   @@unique([pollId, voterId])
-  // one effect per idempotency key, scoped to the poll (safe retries; keys are
-  // meaningful within a poll, so two different polls can reuse a key name)
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
+}
+
+model Shortlink {
+  id        String   @id @default(cuid())
+  cloneSlug String
+  url       String
+  code      String
+  alias     String?
+  createdAt DateTime @default(now())
+
+  @@unique([url])
+  @@unique([code])
+  @@unique([alias])
+  @@index([cloneSlug])
 }
