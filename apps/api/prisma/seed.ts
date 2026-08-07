@@ -13,6 +13,7 @@ async function main() {
       title: 'Poll',
       summary: 'Create a question, vote once, watch a live tally. Correct under concurrent load.',
       demoPath: '/clones/poll',
+      createdBy: 'seed',
     },
   });
   console.log('seeded clone: poll');
