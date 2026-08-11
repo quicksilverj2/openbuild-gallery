@@ -8,14 +8,17 @@
 // Concurrent writers that collide on either index lose with a unique violation,
 // which the API translates into a clean 409 / idempotent replay — never a 500.
 
+
 generator client {
   provider = "prisma-client-js"
 }
+
 
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
 
 model Clone {
   slug      String   @id
@@ -26,6 +29,7 @@ model Clone {
   createdAt DateTime @default(now())
 }
 
+
 model Poll {
   id        String   @id @default(cuid())
   cloneSlug String
@@ -34,8 +38,10 @@ model Poll {
   options   Option[]
   votes     Vote[]
 
+
   @@index([cloneSlug])
 }
+
 
 model Option {
   id        String   @id @default(cuid())
@@ -45,8 +51,10 @@ model Option {
   poll      Poll     @relation(fields: [pollId], references: [id], onDelete: Cascade)
   votes     Vote[]
 
+
   @@index([pollId])
 }
+
 
 model Vote {
   id             String   @id @default(cuid())
@@ -59,10 +67,21 @@ model Vote {
   poll           Poll     @relation(fields: [pollId], references: [id], onDelete: Cascade)
   option         Option   @relation(fields: [optionId], references: [id], onDelete: Cascade)
 
+
   // one vote per voter per poll
   @@unique([pollId, voterId])
   // one effect per idempotency key, scoped to the poll (safe retries; keys are
   // meaningful within a poll, so two different polls can reuse a key name)
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
+}
+
+
+
+model Shortlink {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  url       String
+  clicks    Int      @default(0)
+  createdAt DateTime @default(now())
 }

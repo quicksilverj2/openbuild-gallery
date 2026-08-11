@@ -2,8 +2,6 @@ import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
-// The gallery ships with one clone: the Poll. Bounty #1 deepens it; later
-// bounties add sibling clones (shortlink, paste, wallet, ...).
 async function main() {
   await prisma.clone.upsert({
     where: { slug: 'poll' },
@@ -15,7 +13,19 @@ async function main() {
       demoPath: '/clones/poll',
     },
   });
-  console.log('seeded clone: poll');
+
+  await prisma.clone.upsert({
+    where: { slug: 'shortlink' },
+    update: {},
+    create: {
+      slug: 'shortlink',
+      title: 'Shortlink',
+      summary: 'Create a short URL that redirects to a long one. Tracks click counts.',
+      demoPath: '/clones/shortlink',
+    },
+  });
+
+  console.log('seeded clones: poll, shortlink');
 }
 
 main()
