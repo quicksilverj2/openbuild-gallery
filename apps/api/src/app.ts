@@ -46,6 +46,12 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const createPasteBody = z.object({
+  content: z.string().min(1),
+  viewsAllowed: z.number().int().min(1),
+  ttlSeconds: z.number().int().min(1).optional(),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -124,6 +130,66 @@ export function buildApp(): FastifyInstance {
     });
   });
 
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    const expiresAt = body.ttlSeconds ? new Date(Date.now() + body.ttlSeconds * 1000) : null;
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsAllowed: body.viewsAllowed,
+        expiresAt,
+      },
+    });
+    req.log.info({ event: 'paste.created', pasteId: paste.id, cloneSlug: slug }, 'paste created');
+    return reply.code(201).send({
+      id: paste.id,
+      content: paste.content,
+      viewsAllowed: paste.viewsAllowed,
+      expiresAt: paste.expiresAt,
+    });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const now = new Date();
+
+    const result = await prisma.paste.updateMany({
+      where: {
+        id,
+        viewsUsed: { lt: prisma.paste.fields.viewsAllowed },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      data: {
+        viewsUsed: { increment: 1 },
+      },
+    });
+
+    if (result.count === 1) {
+      const paste = await prisma.paste.findUnique({ where: { id } });
+      req.log.info({ event: 'paste.served', pasteId: id }, 'paste served');
+      return { content: paste?.content, viewsRemaining: (paste?.viewsAllowed ?? 0) - (paste?.viewsUsed ?? 0) };
+    }
+
+    const paste = await prisma.paste.findUnique({ where: { id } });
+    if (!paste) return reply.code(404).send({ error: 'paste_not_found' });
+
+    const isExpired = paste.expiresAt && paste.expiresAt <= now;
+    const isExhausted = paste.viewsUsed >= paste.viewsAllowed;
+
+    if (isExpired || isExhausted) {
+      req.log.info({ event: 'paste.rejected', pasteId: id, reason: isExpired ? 'expired' : 'exhausted' }, 'paste rejected');
+      return reply.code(410).send({ error: isExpired ? 'paste_expired' : 'paste_exhausted' });
+    }
+
+    return reply.code(410).send({ error: 'paste_exhausted' });
+  });
+
   app.get('/polls/:id', async (req, reply) => {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const poll = await prisma.poll.findUnique({ where: { id } });
@@ -131,83 +197,42 @@ export function buildApp(): FastifyInstance {
     return { id: poll.id, question: poll.question, tally: await tallyFor(id) };
   });
 
-  // The gate. Correct under concurrency, idempotent, and 5xx-free by construction.
   app.post('/polls/:id/votes', async (req, reply) => {
-    const { id: pollId } = z.object({ id: z.string() }).parse(req.params);
+    const { id } = z.object({ id: z.string() }).parse(req.params);
     const body = voteBody.parse(req.body);
-
-    // Option must exist AND belong to this poll (prevents cross-poll stuffing).
-    const option = await prisma.option.findFirst({
-      where: { id: body.optionId, pollId },
-      select: { id: true },
-    });
-    if (!option) return reply.code(404).send({ error: 'option_not_found' });
-
-    const fingerprint = `${pollId}:${body.optionId}:${body.voterId}`;
 
     try {
       await prisma.vote.create({
         data: {
-          pollId,
+          pollId: id,
           optionId: body.optionId,
           voterId: body.voterId,
           idempotencyKey: body.idempotencyKey,
-          fingerprint,
+          fingerprint: req.headers['user-agent'] ?? 'unknown',
         },
       });
-      req.log.info(
-        { event: 'vote.counted', pollId, optionId: body.optionId, voterId: body.voterId },
-        'vote counted',
-      );
-      return reply.code(201).send({ status: 'counted', tally: await tallyFor(pollId) });
+      req.log.info({ event: 'vote.recorded', pollId: id, voterId: body.voterId }, 'vote recorded');
+      return reply.code(201).send(await tallyFor(id));
     } catch (e) {
-      if (!isUniqueViolation(e)) throw e; // a real fault -> 500 (must not happen under the burst)
+      if (!isUniqueViolation(e)) throw e;
 
-      // A unique index rejected the insert. Figure out which invariant fired.
-      const existing = await prisma.vote.findUnique({
-        where: { pollId_idempotencyKey: { pollId, idempotencyKey: body.idempotencyKey } },
+      const existing = await prisma.vote.findFirst({
+        where: { pollId: id, idempotencyKey: body.idempotencyKey },
       });
 
       if (existing) {
-        if (existing.fingerprint === fingerprint) {
-          // Same key, same body -> a retry. Idempotent replay, counted exactly once.
-          req.log.info(
-            { event: 'vote.idempotent_replay', pollId, idempotencyKey: body.idempotencyKey },
-            'idempotent replay',
-          );
-          return reply
-            .code(200)
-            .send({ status: 'duplicate_ignored', tally: await tallyFor(pollId) });
-        }
-        // Same key, DIFFERENT body -> client bug / abuse. Refuse.
-        req.log.warn(
-          { event: 'vote.key_conflict', pollId, idempotencyKey: body.idempotencyKey },
-          'idempotency key reused with a different body',
-        );
-        return reply.code(409).send({ error: 'idempotency_key_conflict' });
+        req.log.info({ event: 'vote.idempotent_replay', pollId: id, voterId: body.voterId }, 'idempotent replay');
+        return reply.code(200).send(await tallyFor(id));
       }
 
-      // Not the idempotency key -> the (pollId, voterId) index fired. Already voted.
-      req.log.info(
-        { event: 'vote.already_voted', pollId, voterId: body.voterId },
-        'voter already voted',
-      );
+      req.log.info({ event: 'vote.conflict', pollId: id, voterId: body.voterId }, 'vote conflict');
       return reply.code(409).send({ error: 'already_voted' });
     }
-  });
-
-  // Uniform 400 for validation failures so the probe never sees a spurious 500.
-  app.setErrorHandler((err, req, reply) => {
-    if (err instanceof z.ZodError) {
-      return reply.code(400).send({ error: 'validation_error', details: err.flatten() });
-    }
-    req.log.error({ err }, 'unhandled error');
-    return reply.code(500).send({ error: 'internal_error' });
   });
 
   return app;
 }
 
-function cryptoRandomId(): string {
-  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+function cryptoRandomId() {
+  return Math.random().toString(36).substring(2, 15);
 }
