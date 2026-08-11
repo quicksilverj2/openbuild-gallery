@@ -48,6 +48,49 @@ model Option {
   @@index([pollId])
 }
 
+model Paste {
+  id           String    @id @default(cuid())
+  cloneSlug    String
+  content      String
+  viewsAllowed Int
+  viewsUsed    Int       @default(0)
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([cloneSlug])
+}
+
+model Shortlink {
+  code      String   @id
+  cloneSlug String
+  url       String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([cloneSlug])
+}
+
+model Wallet {
+  id        String   @id @default(cuid())
+  cloneSlug String
+  balance   BigInt   @default(0) // Balance in paise
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cloneSlug])
+}
+
+model Transaction {
+  id             String   @id @default(cuid())
+  walletId       String
+  amount         BigInt   // Positive for deposit, negative for withdrawal/transfer
+  type           String   // 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER'
+  idempotencyKey String
+  createdAt      DateTime @default(now())
+
+  @@unique([walletId, idempotencyKey])
+  @@index([walletId])
+}
+
 model Vote {
   id             String   @id @default(cuid())
   pollId         String
@@ -65,4 +108,29 @@ model Vote {
   // meaningful within a poll, so two different polls can reuse a key name)
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
+}
+
+model Voucher {
+  id          String       @id @default(cuid())
+  cloneSlug   String
+  code        String       @unique
+  createdAt   DateTime     @default(now())
+  redemptions Redemption[]
+
+  @@index([cloneSlug])
+}
+
+model Redemption {
+  id             String   @id @default(cuid())
+  voucherId      String
+  userId         String
+  idempotencyKey String
+  createdAt      DateTime @default(now())
+  voucher        Voucher  @relation(fields: [voucherId], references: [id], onDelete: Cascade)
+
+  // one redemption per voucher (single-use)
+  @@unique([voucherId])
+  // one effect per idempotency key
+  @@unique([voucherId, idempotencyKey])
+  @@index([voucherId])
 }

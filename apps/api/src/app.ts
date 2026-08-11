@@ -1,5 +1,4 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from './db';
@@ -46,6 +45,43 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const createPasteBody = z.object({
+  content: z.string().min(1),
+  viewsAllowed: z.number().int().min(1),
+  ttlSeconds: z.number().int().min(1).optional(),
+});
+
+const shortenBody = z.object({
+  url: z.string().url(),
+  alias: z
+    .string()
+    .min(3)
+    .max(20)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+    .optional(),
+});
+
+const depositBody = z.object({
+  amount: z.number().int().positive(),
+  idempotencyKey: z.string().min(1),
+});
+
+const transferBody = z.object({
+  toWalletId: z.string().min(1),
+  amount: z.number().int().positive(),
+  idempotencyKey: z.string().min(1),
+});
+
+const createVoucherBody = z.object({
+  code: z.string().min(3).max(20),
+});
+
+const redeemVoucherBody = z.object({
+  code: z.string().min(1),
+  userId: z.string().min(1),
+  idempotencyKey: z.string().min(1),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -57,11 +93,9 @@ export function buildApp(): FastifyInstance {
     genReqId: (req) => (req.headers['x-request-id'] as string) ?? cryptoRandomId(),
   });
 
-  // The gallery is a static site on a different origin, so it calls this API
-  // cross-origin. Reflect the configured origin(s), or any origin for the open
-  // sandbox (no cookies/credentials are used, so reflect-any is safe here).
-  app.register(cors, {
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
+  // BigInt serialization support
+  app.setReplySerializer((payload) => {
+    return JSON.stringify(payload, (_, v) => (typeof v === 'bigint' ? v.toString() : v));
   });
 
   app.get('/healthz', async () => ({ status: 'ok' }));
@@ -122,6 +156,297 @@ export function buildApp(): FastifyInstance {
       question: poll.question,
       options: poll.options.map((o) => ({ id: o.id, text: o.text })),
     });
+  });
+
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    const expiresAt = body.ttlSeconds ? new Date(Date.now() + body.ttlSeconds * 1000) : null;
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsAllowed: body.viewsAllowed,
+        expiresAt,
+      },
+    });
+    req.log.info({ event: 'paste.created', pasteId: paste.id, cloneSlug: slug }, 'paste created');
+    return reply.code(201).send({
+      id: paste.id,
+      content: paste.content,
+      viewsAllowed: paste.viewsAllowed,
+      expiresAt: paste.expiresAt,
+    });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const now = new Date();
+
+    // The gate: atomic increment of viewsUsed ONLY if it hasn't hit the limit and
+    // hasn't expired. We use a transaction to ensure we read the state AND update
+    // it atomically, or just use updateMany and check affected rows.
+    // updateMany is safer for concurrency without explicit locking.
+    const result = await prisma.paste.updateMany({
+      where: {
+        id,
+        viewsUsed: { lt: prisma.paste.fields.viewsAllowed },
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      data: {
+        viewsUsed: { increment: 1 },
+      },
+    });
+
+    if (result.count === 1) {
+      const paste = await prisma.paste.findUnique({ where: { id } });
+      req.log.info({ event: 'paste.served', pasteId: id }, 'paste served');
+      return { content: paste?.content, viewsRemaining: (paste?.viewsAllowed ?? 0) - (paste?.viewsUsed ?? 0) };
+    }
+
+    // If we are here, it's either not found, expired, or exhausted.
+    const paste = await prisma.paste.findUnique({ where: { id } });
+    if (!paste) return reply.code(404).send({ error: 'paste_not_found' });
+
+    const isExpired = paste.expiresAt && paste.expiresAt <= now;
+    const isExhausted = paste.viewsUsed >= paste.viewsAllowed;
+
+    if (isExpired || isExhausted) {
+      req.log.info({ event: 'paste.rejected', pasteId: id, reason: isExpired ? 'expired' : 'exhausted' }, 'paste rejected');
+      return reply.code(410).send({ error: isExpired ? 'paste_expired' : 'paste_exhausted' });
+    }
+
+    // This should theoretically not happen if updateMany failed but it's not expired/exhausted,
+    // unless someone else just took the last view between our updateMany and findUnique.
+    return reply.code(410).send({ error: 'paste_exhausted' });
+  });
+
+  app.post('/clones/:slug/shorten', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = shortenBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    try {
+      const shortlink = await prisma.shortlink.create({
+        data: {
+          cloneSlug: slug,
+          url: body.url,
+          code: body.alias || cryptoRandomId().slice(0, 8),
+        },
+      });
+      req.log.info({ event: 'shortlink.created', code: shortlink.code, url: body.url }, 'shortlink created');
+      return reply.code(201).send(shortlink);
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+
+      // Collided on either URL (dedupe) or Code (alias conflict).
+      const existingByUrl = await prisma.shortlink.findUnique({ where: { url: body.url } });
+      if (existingByUrl) {
+        req.log.info({ event: 'shortlink.deduped', code: existingByUrl.code, url: body.url }, 'shortlink deduped');
+        return reply.code(200).send(existingByUrl);
+      }
+
+      // Must be an alias conflict.
+      return reply.code(409).send({ error: 'alias_already_taken' });
+    }
+  });
+
+  app.get('/s/:code', async (req, reply) => {
+    const { code } = z.object({ code: z.string() }).parse(req.params);
+    const shortlink = await prisma.shortlink.findUnique({ where: { code } });
+    if (!shortlink) return reply.code(404).send({ error: 'shortlink_not_found' });
+
+    req.log.info({ event: 'shortlink.redirect', code, url: shortlink.url }, 'shortlink redirect');
+    return reply.redirect(shortlink.url);
+  });
+
+  app.post('/clones/:slug/wallets', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    const wallet = await prisma.wallet.create({
+      data: { cloneSlug: slug },
+    });
+    req.log.info({ event: 'wallet.created', walletId: wallet.id }, 'wallet created');
+    return reply.code(201).send(wallet);
+  });
+
+  app.get('/wallets/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const wallet = await prisma.wallet.findUnique({
+      where: { id },
+      include: {
+        // We don't have a direct relation in the schema for Transaction -> Wallet, 
+        // but we can query transactions by walletId.
+      },
+    });
+    if (!wallet) return reply.code(404).send({ error: 'wallet_not_found' });
+
+    const transactions = await prisma.transaction.findMany({
+      where: { walletId: id },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+
+    return { ...wallet, transactions };
+  });
+
+  app.post('/wallets/:id/deposit', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const body = depositBody.parse(req.body);
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const existing = await tx.transaction.findUnique({
+          where: { walletId_idempotencyKey: { walletId: id, idempotencyKey: body.idempotencyKey } },
+        });
+        if (existing) return { status: 'idempotent_replay', transaction: existing };
+
+        const transaction = await tx.transaction.create({
+          data: {
+            walletId: id,
+            amount: BigInt(body.amount),
+            type: 'DEPOSIT',
+            idempotencyKey: body.idempotencyKey,
+          },
+        });
+
+        const wallet = await tx.wallet.update({
+          where: { id },
+          data: { balance: { increment: BigInt(body.amount) } },
+        });
+
+        return { status: 'created', transaction, balance: wallet.balance };
+      });
+
+      req.log.info({ event: 'wallet.deposit', walletId: id, amount: body.amount }, 'deposit successful');
+      return reply.code(result.status === 'created' ? 201 : 200).send(result);
+    } catch (e) {
+      if (isUniqueViolation(e)) return reply.code(409).send({ error: 'idempotency_key_conflict' });
+      throw e;
+    }
+  });
+
+  app.post('/wallets/:id/transfer', async (req, reply) => {
+    const { id: fromId } = z.object({ id: z.string() }).parse(req.params);
+    const body = transferBody.parse(req.body);
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // 1. Idempotency check
+        const existing = await tx.transaction.findUnique({
+          where: { walletId_idempotencyKey: { walletId: fromId, idempotencyKey: body.idempotencyKey } },
+        });
+        if (existing) return { status: 'idempotent_replay', transaction: existing };
+
+        // 2. Verify destination exists
+        const toWallet = await tx.wallet.findUnique({ where: { id: body.toWalletId } });
+        if (!toWallet) throw new Error('destination_wallet_not_found');
+
+        // 3. Atomic debit with balance check
+        const debitResult = await tx.wallet.updateMany({
+          where: {
+            id: fromId,
+            balance: { gte: BigInt(body.amount) },
+          },
+          data: {
+            balance: { decrement: BigInt(body.amount) },
+          },
+        });
+
+        if (debitResult.count === 0) {
+          const fromWallet = await tx.wallet.findUnique({ where: { id: fromId } });
+          if (!fromWallet) throw new Error('source_wallet_not_found');
+          throw new Error('insufficient_funds');
+        }
+
+        // 4. Credit destination
+        await tx.wallet.update({
+          where: { id: body.toWalletId },
+          data: { balance: { increment: BigInt(body.amount) } },
+        });
+
+        // 5. Record transaction
+        const transaction = await tx.transaction.create({
+          data: {
+            walletId: fromId,
+            amount: -BigInt(body.amount),
+            type: 'TRANSFER',
+            idempotencyKey: body.idempotencyKey,
+          },
+        });
+
+        return { status: 'created', transaction };
+      });
+
+      req.log.info({ event: 'wallet.transfer', from: fromId, to: body.toWalletId, amount: body.amount }, 'transfer successful');
+      return reply.code(result.status === 'created' ? 201 : 200).send(result);
+    } catch (e: any) {
+      if (isUniqueViolation(e)) return reply.code(409).send({ error: 'idempotency_key_conflict' });
+      if (e.message === 'insufficient_funds') return reply.code(400).send({ error: 'insufficient_funds' });
+      if (e.message === 'source_wallet_not_found') return reply.code(404).send({ error: 'source_wallet_not_found' });
+      if (e.message === 'destination_wallet_not_found') return reply.code(404).send({ error: 'destination_wallet_not_found' });
+      throw e;
+    }
+  });
+
+  app.post('/clones/:slug/vouchers', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createVoucherBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    try {
+      const voucher = await prisma.voucher.create({
+        data: {
+          cloneSlug: slug,
+          code: body.code,
+        },
+      });
+      req.log.info({ event: 'voucher.created', voucherId: voucher.id, code: voucher.code }, 'voucher created');
+      return reply.code(201).send(voucher);
+    } catch (e) {
+      if (isUniqueViolation(e)) return reply.code(409).send({ error: 'code_already_taken' });
+      throw e;
+    }
+  });
+
+  app.post('/vouchers/redeem', async (req, reply) => {
+    const body = redeemVoucherBody.parse(req.body);
+    const voucher = await prisma.voucher.findUnique({ where: { code: body.code } });
+    if (!voucher) return reply.code(404).send({ error: 'voucher_not_found' });
+
+    try {
+      const redemption = await prisma.redemption.create({
+        data: {
+          voucherId: voucher.id,
+          userId: body.userId,
+          idempotencyKey: body.idempotencyKey,
+        },
+      });
+      req.log.info({ event: 'voucher.redeemed', voucherId: voucher.id, userId: body.userId }, 'voucher redeemed');
+      return reply.code(201).send(redemption);
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+
+      const existing = await prisma.redemption.findUnique({
+        where: { voucherId: voucher.id },
+      });
+
+      if (existing?.idempotencyKey === body.idempotencyKey && existing?.userId === body.userId) {
+        req.log.info({ event: 'voucher.redeem_idempotent', voucherId: voucher.id, userId: body.userId }, 'voucher redeem idempotent');
+        return reply.code(200).send(existing);
+      }
+
+      req.log.info({ event: 'voucher.redeem_conflict', voucherId: voucher.id, userId: body.userId }, 'voucher redeem conflict');
+      return reply.code(409).send({ error: 'voucher_already_redeemed' });
+    }
   });
 
   app.get('/polls/:id', async (req, reply) => {
