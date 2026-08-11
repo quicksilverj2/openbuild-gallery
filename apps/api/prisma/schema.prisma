@@ -48,6 +48,49 @@ model Option {
   @@index([pollId])
 }
 
+model Paste {
+  id           String    @id @default(cuid())
+  cloneSlug    String
+  content      String
+  viewsAllowed Int
+  viewsUsed    Int       @default(0)
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([cloneSlug])
+}
+
+model Shortlink {
+  code      String   @id
+  cloneSlug String
+  url       String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([cloneSlug])
+}
+
+model Wallet {
+  id        String   @id @default(cuid())
+  cloneSlug String
+  balance   BigInt   @default(0) // Balance in paise
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cloneSlug])
+}
+
+model Transaction {
+  id             String   @id @default(cuid())
+  walletId       String
+  amount         BigInt   // Positive for deposit, negative for withdrawal/transfer
+  type           String   // 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER'
+  idempotencyKey String
+  createdAt      DateTime @default(now())
+
+  @@unique([walletId, idempotencyKey])
+  @@index([walletId])
+}
+
 model Vote {
   id             String   @id @default(cuid())
   pollId         String
