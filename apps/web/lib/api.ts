@@ -34,6 +34,14 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return json as T;
 }
 
+export type Paste = {
+  id: string;
+  content: string;
+  viewsLeft: number;
+  viewsAllowed: number;
+  expiresAt?: string | null;
+};
+
 export const api = {
   clones: () => req<{ clones: Clone[] }>('/clones'),
   createPoll: (slug: string, question: string, options: string[]) =>
@@ -47,4 +55,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ optionId, voterId, idempotencyKey }),
     }),
+  createPaste: (slug: string, content: string, viewsAllowed: number = 1, ttlSeconds?: number) =>
+    req<Paste>(`/clones/${slug}/pastes`, {
+      method: 'POST',
+      body: JSON.stringify({ content, viewsAllowed, ttlSeconds }),
+    }),
+  getPaste: (id: string) => req<Paste>(`/pastes/${id}`),
 };

@@ -66,3 +66,15 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model Paste {
+  id           String    @id @default(cuid())
+  cloneSlug    String    @default("paste")
+  content      String
+  viewsAllowed Int       @default(1)
+  viewsLeft    Int       @default(1)
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([cloneSlug])
+}
