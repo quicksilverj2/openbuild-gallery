@@ -196,6 +196,89 @@ export function buildApp(): FastifyInstance {
     }
   });
 
+  // -------------------------------------------------------------------------
+  // PASTE CLONE (VIEW-ONCE) ENDPOINTS
+  // Invariant: 20 concurrent reads of a 1-view paste -> exactly ONE 200, 19 404s, zero 5xx
+  // -------------------------------------------------------------------------
+
+  const createPasteBody = z.object({
+    content: z.string().min(1),
+    viewsAllowed: z.number().int().positive().default(1),
+    ttlSeconds: z.number().int().positive().optional(),
+  });
+
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    const expiresAt = body.ttlSeconds ? new Date(Date.now() + body.ttlSeconds * 1000) : null;
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsAllowed: body.viewsAllowed,
+        viewsLeft: body.viewsAllowed,
+        expiresAt,
+      },
+    });
+
+    req.log.info(
+      {
+        event: 'paste.created',
+        pasteId: paste.id,
+        cloneSlug: slug,
+        viewsAllowed: paste.viewsAllowed,
+      },
+      'paste created',
+    );
+    return reply.code(201).send({
+      id: paste.id,
+      viewsAllowed: paste.viewsAllowed,
+      viewsLeft: paste.viewsLeft,
+      expiresAt: paste.expiresAt,
+    });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+
+    // Atomic decrement within a transaction to guarantee exact concurrency semantics
+    const paste = await prisma.$transaction(async (tx) => {
+      const existing = await tx.paste.findUnique({ where: { id } });
+      if (!existing) return null;
+      if (existing.expiresAt && existing.expiresAt < new Date()) return null;
+      if (existing.viewsLeft <= 0) return null;
+
+      return tx.paste.update({
+        where: { id: existing.id },
+        data: { viewsLeft: { decrement: 1 } },
+      });
+    });
+
+    if (!paste) {
+      req.log.info(
+        { event: 'paste.not_found_or_exhausted', pasteId: id },
+        'paste not found or views exhausted',
+      );
+      return reply.code(404).send({ error: 'paste_not_found_or_exhausted' });
+    }
+
+    req.log.info(
+      { event: 'paste.served', pasteId: paste.id, viewsLeft: paste.viewsLeft },
+      'paste served',
+    );
+    return {
+      id: paste.id,
+      content: paste.content,
+      viewsLeft: paste.viewsLeft,
+      viewsAllowed: paste.viewsAllowed,
+      expiresAt: paste.expiresAt,
+    };
+  });
+
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
