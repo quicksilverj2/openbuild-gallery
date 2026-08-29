@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from './db';
+import { registerShortlinkRoutes } from './shortlink-routes';
 
 /**
  * OpenBuild Gallery API — the seed product is a "Poll" clone.
@@ -63,6 +64,9 @@ export function buildApp(): FastifyInstance {
   app.register(cors, {
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
   });
+
+  // Register shortlink clone routes
+  registerShortlinkRoutes(app);
 
   app.get('/healthz', async () => ({ status: 'ok' }));
 
@@ -194,6 +198,65 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  // --- Shortlink Clone Routes ---
+  const shortenBody = z.object({
+    url: z.string().url(),
+    alias: z.string().min(1).max(64).optional(),
+  });
+
+  function generateCode(): string {
+    // Non-enumerable Base62 code using crypto-safe bytes.
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    let code = '';
+    for (const b of bytes) code += alphabet[b % alphabet.length];
+    return code;
+  }
+
+  app.post('/shorten', async (req, reply) => {
+    const body = shortenBody.parse(req.body);
+    const MAX_ATTEMPTS = 5;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const code = body.alias ?? generateCode();
+      try {
+        const link = await prisma.shortlink.create({
+          data: { url: body.url, alias: body.alias ?? null, code },
+        });
+        req.log.info({ event: 'shortlink.created', code }, 'shortlink created');
+        return reply.code(201).send({ code, url: link.url, shortUrl: `/${code}` });
+      } catch (e) {
+        if (!isUniqueViolation(e)) throw e;
+
+        // Unique constraint fired. Could be (url, alias) or (code).
+        if (body.alias) {
+          // If user supplied an alias and it collided on (url, alias), return existing.
+          const existing = await prisma.shortlink.findFirst({
+            where: { url: body.url, alias: body.alias },
+          });
+          if (existing) {
+            req.log.info({ event: 'shortlink.idempotent_replay', code: existing.code }, 'shortlink replay');
+            return reply.code(200).send({ code: existing.code, url: existing.url, shortUrl: `/${existing.code}` });
+          }
+          // Otherwise the alias itself is taken by a different URL -> conflict.
+          return reply.code(409).send({ error: 'alias_taken' });
+        }
+
+        // No alias supplied -> generated code collided. Retry with a new code.
+        req.log.warn({ event: 'shortlink.code_collision', attempt }, 'generated code collided, retrying');
+      }
+    }
+
+    return reply.code(503).send({ error: 'code_generation_exhausted' });
+  });
+
+  app.get('/:code', async (req, reply) => {
+    const { code } = z.object({ code: z.string() }).parse(req.params);
+    const link = await prisma.shortlink.findUnique({ where: { code } });
+    if (!link) return reply.code(404).send({ error: 'not_found' });
+    return reply.redirect(link.url);
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.

@@ -66,3 +66,19 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Shortlink clone — append-only URL registry with concurrency-safe alias generation.
+// Unique constraints enforce:
+//   - one short code per generated value  -> no collisions from concurrent inserts
+//   - one canonical mapping per (url, alias) -> safe retries; same input always resolves to same code
+// Race conditions on insert are caught as P2002 and translated to 409/idempotent replay by the API layer.
+model Shortlink {
+  id        String   @id @default(cuid())
+  url       String
+  alias     String?
+  code      String   @unique
+  createdAt DateTime @default(now())
+
+  @@unique([url, alias])
+  @@index([code])
+}
