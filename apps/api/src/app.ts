@@ -46,6 +46,21 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+declare module 'fastify' {
+  interface FastifyRequest {
+    cloneSlug?: string;
+  }
+}
+
+const requestCounters = new Map<string, number>();
+
+
+const createPasteBody = z.object({
+  content: z.string().min(1),
+  viewsAllowed: z.number().int().min(1),
+  ttlSeconds: z.number().int().min(1).optional(),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -60,8 +75,17 @@ export function buildApp(): FastifyInstance {
   // The gallery is a static site on a different origin, so it calls this API
   // cross-origin. Reflect the configured origin(s), or any origin for the open
   // sandbox (no cookies/credentials are used, so reflect-any is safe here).
-  app.register(cors, {
+app.register(cors, {
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
+  });
+
+  app.addHook('onResponse', (req, reply, done) => {
+    const clone = req.cloneSlug || 'system';
+    const status = reply.statusCode;
+    const method = req.method;
+    const key = `${clone}|${method}|${status}`;
+    requestCounters.set(key, (requestCounters.get(key) || 0) + 1);
+    done();
   });
 
   app.get('/healthz', async () => ({ status: 'ok' }));
@@ -83,7 +107,7 @@ export function buildApp(): FastifyInstance {
       prisma.vote.count(),
     ]);
     reply.header('content-type', 'text/plain; version=0.0.4');
-    return [
+    const lines = [
       '# HELP openbuild_clones_total Number of clones in the gallery.',
       '# TYPE openbuild_clones_total gauge',
       `openbuild_clones_total ${clones}`,
@@ -93,8 +117,68 @@ export function buildApp(): FastifyInstance {
       '# HELP openbuild_votes_total Number of votes recorded.',
       '# TYPE openbuild_votes_total counter',
       `openbuild_votes_total ${votes}`,
+      '# HELP openbuild_http_requests_total HTTP requests per clone',
+      '# TYPE openbuild_http_requests_total counter',
       '',
-    ].join('\n');
+];
+    for (const [key, count] of requestCounters.entries()) {
+      const [clone, method, status] = key.split('|');
+      lines.push(`openbuild_http_requests_total{clone="${clone}",method="${method}",status="${status}"} ${count}`);
+    }
+    lines.push('');
+    return lines.join('\n');
+  });
+
+  
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    req.cloneSlug = slug;
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    let expiresAt: Date | null = null;
+    if (body.ttlSeconds) {
+      expiresAt = new Date(Date.now() + body.ttlSeconds * 1000);
+    }
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsRemaining: body.viewsAllowed,
+        expiresAt,
+      },
+    });
+    
+    req.log.info({ event: 'paste.created', pasteId: paste.id, cloneSlug: slug }, 'paste created');
+    return reply.code(201).send({ id: paste.id, viewsAllowed: body.viewsAllowed, expiresAt });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+
+    const rows = await prisma.$queryRaw<any[]>`
+      UPDATE "Paste"
+      SET "viewsRemaining" = "viewsRemaining" - 1
+      WHERE "id" = ${id} AND "viewsRemaining" > 0 AND ("expiresAt" IS NULL OR "expiresAt" > now())
+      RETURNING *;
+    `;
+
+    if (!rows || rows.length === 0) {
+      req.log.warn({ event: 'paste.read_failed', pasteId: id }, 'paste read failed (exhausted, expired, or missing)');
+      return reply.code(404).send({ error: 'not_found_or_exhausted' });
+    }
+
+    const paste = rows[0];
+    req.cloneSlug = paste.cloneSlug;
+    req.log.info({ event: 'paste.read', pasteId: id }, 'paste read');
+
+    return {
+      id: paste.id,
+      content: paste.content,
+      viewsRemaining: paste.viewsRemaining,
+    };
   });
 
   app.get('/clones', async () => {
@@ -104,6 +188,7 @@ export function buildApp(): FastifyInstance {
 
   app.post('/clones/:slug/polls', async (req, reply) => {
     const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    req.cloneSlug = slug;
     const body = createPollBody.parse(req.body);
     const clone = await prisma.clone.findUnique({ where: { slug } });
     if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
@@ -128,6 +213,7 @@ export function buildApp(): FastifyInstance {
     const { id } = z.object({ id: z.string() }).parse(req.params);
     const poll = await prisma.poll.findUnique({ where: { id } });
     if (!poll) return reply.code(404).send({ error: 'poll_not_found' });
+    req.cloneSlug = poll.cloneSlug;
     return { id: poll.id, question: poll.question, tally: await tallyFor(id) };
   });
 
@@ -139,9 +225,10 @@ export function buildApp(): FastifyInstance {
     // Option must exist AND belong to this poll (prevents cross-poll stuffing).
     const option = await prisma.option.findFirst({
       where: { id: body.optionId, pollId },
-      select: { id: true },
+      select: { id: true, poll: { select: { cloneSlug: true } } },
     });
     if (!option) return reply.code(404).send({ error: 'option_not_found' });
+    req.cloneSlug = option.poll.cloneSlug;
 
     const fingerprint = `${pollId}:${body.optionId}:${body.voterId}`;
 
