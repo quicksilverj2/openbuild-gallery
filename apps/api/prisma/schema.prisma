@@ -66,3 +66,30 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model Wallet {
+  id        String @id @default(cuid())
+  cloneSlug String
+  ownerId   String
+  balance   Int    @default(0)
+  
+  sentTransfers     Transfer[] @relation("TransferFrom")
+  receivedTransfers Transfer[] @relation("TransferTo")
+  
+  @@unique([cloneSlug, ownerId])
+  @@index([cloneSlug])
+}
+
+model Transfer {
+  id             String @id @default(cuid())
+  idempotencyKey String
+  fromId         String
+  toId           String
+  amount         Int
+  createdAt      DateTime @default(now())
+
+  fromWallet Wallet @relation("TransferFrom", fields: [fromId], references: [id])
+  toWallet   Wallet @relation("TransferTo", fields: [toId], references: [id])
+
+  @@unique([fromId, idempotencyKey])
+}

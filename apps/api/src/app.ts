@@ -46,6 +46,18 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+
+const createWalletBody = z.object({
+  ownerId: z.string().min(1),
+  initialBalance: z.number().int().min(0).optional().default(0),
+});
+
+const transferBody = z.object({
+  toId: z.string().min(1),
+  amount: z.number().int().min(1),
+  idempotencyKey: z.string().min(1),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -95,6 +107,97 @@ export function buildApp(): FastifyInstance {
       `openbuild_votes_total ${votes}`,
       '',
     ].join('\n');
+  });
+
+  
+  app.post('/clones/:slug/wallets', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createWalletBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    try {
+      const wallet = await prisma.wallet.create({
+        data: {
+          cloneSlug: slug,
+          ownerId: body.ownerId,
+          balance: body.initialBalance,
+        },
+      });
+      req.log.info({ event: 'wallet.created', walletId: wallet.id, cloneSlug: slug }, 'wallet created');
+      return reply.code(201).send(wallet);
+    } catch (e: any) {
+      if (isUniqueViolation(e)) return reply.code(409).send({ error: 'wallet_exists' });
+      throw e;
+    }
+  });
+
+  app.get('/wallets/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const wallet = await prisma.wallet.findUnique({ where: { id } });
+    if (!wallet) return reply.code(404).send({ error: 'not_found' });
+    return wallet;
+  });
+
+  app.post('/wallets/:id/transfers', async (req, reply) => {
+    const { id: fromId } = z.object({ id: z.string() }).parse(req.params);
+    const body = transferBody.parse(req.body);
+
+    if (fromId === body.toId) return reply.code(400).send({ error: 'self_transfer' });
+
+    try {
+      const res = await prisma.$transaction(async (tx) => {
+        const transfer = await tx.transfer.create({
+          data: {
+            fromId,
+            toId: body.toId,
+            amount: body.amount,
+            idempotencyKey: body.idempotencyKey,
+          },
+        });
+
+        const rows = await tx.$queryRaw<any[]>`
+          UPDATE "Wallet"
+          SET "balance" = "balance" - ${body.amount}
+          WHERE "id" = ${fromId} AND "balance" >= ${body.amount}
+          RETURNING *;
+        `;
+        
+        if (!rows || rows.length === 0) {
+          throw new Error('INSUFFICIENT_FUNDS');
+        }
+        
+        await tx.$queryRaw`
+          UPDATE "Wallet"
+          SET "balance" = "balance" + ${body.amount}
+          WHERE "id" = ${body.toId}
+        `;
+        
+        return { transfer, balance: rows[0].balance };
+      });
+      
+      req.log.info({ event: 'transfer.completed', fromId, toId: body.toId, amount: body.amount }, 'transferred');
+      return reply.code(201).send(res);
+    } catch (e: any) {
+      if (isUniqueViolation(e)) {
+        const existing = await prisma.transfer.findUnique({
+          where: { fromId_idempotencyKey: { fromId, idempotencyKey: body.idempotencyKey } }
+        });
+        if (existing && existing.toId === body.toId && existing.amount === body.amount) {
+          req.log.info({ event: 'transfer.idempotent_replay', fromId }, 'idempotent replay');
+          return reply.code(200).send({ transfer: existing });
+        }
+        return reply.code(409).send({ error: 'idempotency_key_conflict' });
+      }
+      if (e.message === 'INSUFFICIENT_FUNDS') {
+        req.log.info({ event: 'transfer.rejected', fromId }, 'rejected due to insufficient funds');
+        return reply.code(409).send({ error: 'insufficient_funds' });
+      }
+      if (e.code === 'P2003') { // Foreign key constraint failed (e.g. toWallet doesn't exist)
+         return reply.code(404).send({ error: 'wallet_not_found' });
+      }
+      throw e;
+    }
   });
 
   app.get('/clones', async () => {
