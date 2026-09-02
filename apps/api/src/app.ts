@@ -54,6 +54,13 @@ declare module 'fastify' {
 
 const requestCounters = new Map<string, number>();
 
+
+const createPasteBody = z.object({
+  content: z.string().min(1),
+  viewsAllowed: z.number().int().min(1),
+  ttlSeconds: z.number().int().min(1).optional(),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -120,6 +127,58 @@ app.register(cors, {
     }
     lines.push('');
     return lines.join('\n');
+  });
+
+  
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    req.cloneSlug = slug;
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    let expiresAt: Date | null = null;
+    if (body.ttlSeconds) {
+      expiresAt = new Date(Date.now() + body.ttlSeconds * 1000);
+    }
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsRemaining: body.viewsAllowed,
+        expiresAt,
+      },
+    });
+    
+    req.log.info({ event: 'paste.created', pasteId: paste.id, cloneSlug: slug }, 'paste created');
+    return reply.code(201).send({ id: paste.id, viewsAllowed: body.viewsAllowed, expiresAt });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+
+    const rows = await prisma.$queryRaw<any[]>`
+      UPDATE "Paste"
+      SET "viewsRemaining" = "viewsRemaining" - 1
+      WHERE "id" = ${id} AND "viewsRemaining" > 0 AND ("expiresAt" IS NULL OR "expiresAt" > now())
+      RETURNING *;
+    `;
+
+    if (!rows || rows.length === 0) {
+      req.log.warn({ event: 'paste.read_failed', pasteId: id }, 'paste read failed (exhausted, expired, or missing)');
+      return reply.code(404).send({ error: 'not_found_or_exhausted' });
+    }
+
+    const paste = rows[0];
+    req.cloneSlug = paste.cloneSlug;
+    req.log.info({ event: 'paste.read', pasteId: id }, 'paste read');
+
+    return {
+      id: paste.id,
+      content: paste.content,
+      viewsRemaining: paste.viewsRemaining,
+    };
   });
 
   app.get('/clones', async () => {
