@@ -1,11 +1,12 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+﻿import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from './db';
+import { observabilityPlugin, getHttpMetricsAsPrometheus } from './observability';
 
 /**
- * OpenBuild Gallery API — the seed product is a "Poll" clone.
+ * OpenBuild Gallery API â€” the seed product is a "Poll" clone.
  *
  * The interesting endpoint is POST /polls/:id/votes. Its whole job is to stay
  * correct under a concurrent burst: one vote per voter, safe client retries,
@@ -48,7 +49,7 @@ const voteBody = z.object({
 
 export function buildApp(): FastifyInstance {
   const app = Fastify({
-    // Structured JSON logs with a per-request correlation id — the observability
+    // Structured JSON logs with a per-request correlation id â€” the observability
     // hook the reviewer bot reads to confirm the invariant events actually fired.
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
@@ -63,6 +64,7 @@ export function buildApp(): FastifyInstance {
   app.register(cors, {
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
   });
+  app.register(observabilityPlugin);
 
   app.get('/healthz', async () => ({ status: 'ok' }));
 
@@ -91,8 +93,11 @@ export function buildApp(): FastifyInstance {
       '# TYPE openbuild_polls_total counter',
       `openbuild_polls_total ${polls}`,
       '# HELP openbuild_votes_total Number of votes recorded.',
+      ...getHttpMetricsAsPrometheus(),
       '# TYPE openbuild_votes_total counter',
+      ...getHttpMetricsAsPrometheus(),
       `openbuild_votes_total ${votes}`,
+      ...getHttpMetricsAsPrometheus(),
       '',
     ].join('\n');
   });
@@ -156,7 +161,14 @@ export function buildApp(): FastifyInstance {
         },
       });
       req.log.info(
-        { event: 'vote.counted', pollId, optionId: body.optionId, voterId: body.voterId },
+        {
+          event: 'vote.counted',
+          correlationId: req.correlationId,
+          clone: 'poll',
+          pollId,
+          optionId: body.optionId,
+          voterId: body.voterId,
+        },
         'vote counted',
       );
       return reply.code(201).send({ status: 'counted', tally: await tallyFor(pollId) });
@@ -172,7 +184,13 @@ export function buildApp(): FastifyInstance {
         if (existing.fingerprint === fingerprint) {
           // Same key, same body -> a retry. Idempotent replay, counted exactly once.
           req.log.info(
-            { event: 'vote.idempotent_replay', pollId, idempotencyKey: body.idempotencyKey },
+            {
+              event: 'vote.idempotent_replay',
+              correlationId: req.correlationId,
+              clone: 'poll',
+              pollId,
+              idempotencyKey: body.idempotencyKey,
+            },
             'idempotent replay',
           );
           return reply
@@ -181,15 +199,27 @@ export function buildApp(): FastifyInstance {
         }
         // Same key, DIFFERENT body -> client bug / abuse. Refuse.
         req.log.warn(
-          { event: 'vote.key_conflict', pollId, idempotencyKey: body.idempotencyKey },
+          {
+            event: 'vote.key_conflict',
+            correlationId: req.correlationId,
+            clone: 'poll',
+            pollId,
+            idempotencyKey: body.idempotencyKey,
+          },
           'idempotency key reused with a different body',
         );
         return reply.code(409).send({ error: 'idempotency_key_conflict' });
       }
 
       // Not the idempotency key -> the (pollId, voterId) index fired. Already voted.
-      req.log.info(
-        { event: 'vote.already_voted', pollId, voterId: body.voterId },
+      req.log.warn(
+        {
+          event: 'already_voted',
+          correlationId: req.correlationId,
+          clone: 'poll',
+          pollId,
+          voterId: body.voterId,
+        },
         'voter already voted',
       );
       return reply.code(409).send({ error: 'already_voted' });
