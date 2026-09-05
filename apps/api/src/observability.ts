@@ -27,17 +27,15 @@ export function getHttpMetricsAsPrometheus(): string[] {
   ];
   for (const [key, n] of counters) {
     const [clone, method, status] = key.split('|');
-    lines.push(
-      `openbuild_http_requests_total{clone="${clone}",method="${method}",status="${status}"} ${n}`,
-    );
+    lines.push(`openbuild_http_requests_total{clone="${clone}",method="${method}",status="${status}"} ${n}`);
   }
   return lines;
 }
 
 export function deriveCloneFromUrl(url: string): string {
-  const cleanUrl = url.split('?')[0];
+  const cleanUrl = url.split('?')[0] ?? '';
   const cloneMatch = cleanUrl.match(/^\/clones\/([^/]+)/);
-  if (cloneMatch) return cloneMatch[1];
+  if (cloneMatch?.[1]) return cloneMatch[1];
   if (cleanUrl.startsWith('/polls')) return 'poll';
   return 'core';
 }
