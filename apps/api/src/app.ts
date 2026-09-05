@@ -160,7 +160,15 @@ export function buildApp(): FastifyInstance {
           fingerprint,
         },
       });
-      req.log.info({ event: 'vote.counted', correlationId: req.correlationId, clone: 'poll', pollId, optionId: body.optionId, voterId: body.voterId },
+      req.log.info(
+        {
+          event: 'vote.counted',
+          correlationId: req.correlationId,
+          clone: 'poll',
+          pollId,
+          optionId: body.optionId,
+          voterId: body.voterId,
+        },
         'vote counted',
       );
       return reply.code(201).send({ status: 'counted', tally: await tallyFor(pollId) });
@@ -175,7 +183,14 @@ export function buildApp(): FastifyInstance {
       if (existing) {
         if (existing.fingerprint === fingerprint) {
           // Same key, same body -> a retry. Idempotent replay, counted exactly once.
-          req.log.info({ event: 'vote.idempotent_replay', correlationId: req.correlationId, clone: 'poll', pollId, idempotencyKey: body.idempotencyKey },
+          req.log.info(
+            {
+              event: 'vote.idempotent_replay',
+              correlationId: req.correlationId,
+              clone: 'poll',
+              pollId,
+              idempotencyKey: body.idempotencyKey,
+            },
             'idempotent replay',
           );
           return reply
@@ -183,14 +198,28 @@ export function buildApp(): FastifyInstance {
             .send({ status: 'duplicate_ignored', tally: await tallyFor(pollId) });
         }
         // Same key, DIFFERENT body -> client bug / abuse. Refuse.
-        req.log.warn({ event: 'vote.key_conflict', correlationId: req.correlationId, clone: 'poll', pollId, idempotencyKey: body.idempotencyKey },
+        req.log.warn(
+          {
+            event: 'vote.key_conflict',
+            correlationId: req.correlationId,
+            clone: 'poll',
+            pollId,
+            idempotencyKey: body.idempotencyKey,
+          },
           'idempotency key reused with a different body',
         );
         return reply.code(409).send({ error: 'idempotency_key_conflict' });
       }
 
       // Not the idempotency key -> the (pollId, voterId) index fired. Already voted.
-      req.log.warn({ event: 'already_voted', correlationId: req.correlationId, clone: 'poll', pollId, voterId: body.voterId },
+      req.log.warn(
+        {
+          event: 'already_voted',
+          correlationId: req.correlationId,
+          clone: 'poll',
+          pollId,
+          voterId: body.voterId,
+        },
         'voter already voted',
       );
       return reply.code(409).send({ error: 'already_voted' });
@@ -212,7 +241,3 @@ export function buildApp(): FastifyInstance {
 function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
-
-
-
-

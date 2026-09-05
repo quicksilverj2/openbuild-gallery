@@ -27,7 +27,9 @@ export function getHttpMetricsAsPrometheus(): string[] {
   ];
   for (const [key, n] of counters) {
     const [clone, method, status] = key.split('|');
-    lines.push(`openbuild_http_requests_total{clone="${clone}",method="${method}",status="${status}"} ${n}`);
+    lines.push(
+      `openbuild_http_requests_total{clone="${clone}",method="${method}",status="${status}"} ${n}`,
+    );
   }
   return lines;
 }

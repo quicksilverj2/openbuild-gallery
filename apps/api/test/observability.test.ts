@@ -61,8 +61,12 @@ describe('Observability Plugin & Invariants', () => {
 
     const body = metricsRes.body;
     expect(body).toContain('# TYPE openbuild_http_requests_total counter');
-    expect(body).toContain('openbuild_http_requests_total{clone="core",method="GET",status="200"} 1');
-    expect(body).toContain('openbuild_http_requests_total{clone="poll",method="POST",status="201"} 1');
+    expect(body).toContain(
+      'openbuild_http_requests_total{clone="core",method="GET",status="200"} 1',
+    );
+    expect(body).toContain(
+      'openbuild_http_requests_total{clone="poll",method="POST",status="201"} 1',
+    );
   });
 
   it('preserves invariants and produces zero 5xx under concurrent bursts', async () => {
@@ -86,7 +90,7 @@ describe('Observability Plugin & Invariants', () => {
           voterId: 'voter-concurrent-test',
           idempotencyKey: `key-${i}`,
         },
-      })
+      }),
     );
 
     const responses = await Promise.all(requests);
@@ -96,10 +100,13 @@ describe('Observability Plugin & Invariants', () => {
     expect(has5xx).toBe(false);
 
     // Exactamente 1 voto aceptado (201) y 19 rechazados por ya haber votado (409)
-    const statusCounts = responses.reduce((acc, r) => {
-      acc[r.statusCode] = (acc[r.statusCode] ?? 0) + 1;
-      return acc;
-    }, {} as Record<number, number>);
+    const statusCounts = responses.reduce(
+      (acc, r) => {
+        acc[r.statusCode] = (acc[r.statusCode] ?? 0) + 1;
+        return acc;
+      },
+      {} as Record<number, number>,
+    );
 
     expect(statusCounts[201]).toBe(1);
     expect(statusCounts[409]).toBe(19);
