@@ -50,18 +50,21 @@ jobs:
               return;
             }
 
-            const probeGreen = /all invariants held/.test(probe);
+            // Each probe prints "all invariants held" on success.
+            const pollGreen = /=== Poll probe ===[\s\S]*?all invariants held/.test(probe);
+            const shortlinkGreen = /=== Shortlink probe ===[\s\S]*?all invariants held/.test(probe);
+            const allProbesGreen = pollGreen && shortlinkGreen;
             const runUrl = run.html_url;
 
             let verdict, gloss;
-            if (ciPassed && probeGreen) {
+            if (ciPassed && allProbesGreen) {
               verdict = '✅ **merge-candidate**';
               gloss =
-                'CI is green from a clean checkout **and** the live concurrency probe held with zero 5xx. ' +
-                'Pending your review (and tournament ranking if this bounty is contested).';
-            } else if (!ciPassed && probe && !probeGreen) {
+                'CI is green from a clean checkout **and** all live concurrency probes held with zero 5xx '
+                + '(poll + shortlink). Pending your review (and tournament ranking if this bounty is contested).';
+            } else if (!ciPassed && probe && !allProbesGreen) {
               verdict = '🔧 **needs-work**';
-              gloss = 'The live concurrency probe reproduced a failure under load — see the distribution below.';
+              gloss = 'One or more live concurrency probes reproduced a failure under load — see the distribution below.';
             } else {
               verdict = '🔧 **needs-work**';
               gloss = 'A required check is red. See the run for the failing step.';
@@ -69,7 +72,7 @@ jobs:
 
             const probeBlock = probe
               ? `\n<details><summary>Live concurrency probe output</summary>\n\n\`\`\`\n${probe}\n\`\`\`\n</details>\n`
-              : '\n_Probe did not run (an earlier gate failed)._\n';
+              : '\_Probe did not run (an earlier gate failed)._\n';
 
             const body = [
               MARKER,
@@ -80,7 +83,8 @@ jobs:
               '| Gate | Result |',
               '| --- | --- |',
               `| CI (build · lint · typecheck · whole suite · migrations) | ${ciPassed ? '✅ pass' : '❌ fail'} |`,
-              `| Live concurrency probe (zero 5xx, invariant holds) | ${probeGreen ? '✅ pass' : (probe ? '❌ fail' : '⚠️ did not run')} |`,
+              `| Live concurrency probe — Poll | ${pollGreen ? '✅ pass' : (probe && probe.includes('Poll probe') ? '❌ fail' : '⚠️ did not run')} |`,
+              `| Live concurrency probe — Shortlink | ${shortlinkGreen ? '✅ pass' : (probe && probe.includes('Shortlink probe') ? '❌ fail' : '⚠️ did not run')} |`,
               probeBlock,
               `[Full CI run](${runUrl})`,
               '',
