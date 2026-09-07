@@ -59,12 +59,18 @@ jobs:
           SERVER_PID=$!
           bash probes/wait-ready.sh http://localhost:3000/readyz 60
           set +e
-          node probes/concurrency.mjs http://localhost:3000 | tee probe-output.txt
+          {
+            echo "=== Poll probe ==="
+            node probes/concurrency.mjs http://localhost:3000
+            echo ""
+            echo "=== Shortlink probe ==="
+            node probes/shortlink-concurrency.mjs http://localhost:3000
+          } | tee probe-output.txt
           STATUS=${PIPESTATUS[0]}
           kill "$SERVER_PID" 2>/dev/null || true
           exit "$STATUS"
-        # concurrency.mjs exits NON-ZERO if the invariant breaks (double-vote, lost
-        # update, or any 5xx under the burst). Output is captured for the reviewer bot.
+        # Both probes exit NON-ZERO if any invariant breaks. Output is captured
+        # for the reviewer bot. Each probe prints "all invariants held" on success.
 
       # Hand the probe output + PR number to the reviewer bot (which runs in a
       # separate, trusted workflow_run context and never touches the PR code).

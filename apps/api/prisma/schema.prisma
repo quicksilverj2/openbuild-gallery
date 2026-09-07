@@ -66,3 +66,16 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// ShortLink clone — deterministic short URLs with concurrency safety.
+// Invariants under burst:
+//   - identical URLs deduplicate → exactly one code created, rest get 409
+//   - identical aliases deduplicate → same behavior
+//   - no 5xx from races; unique constraints absorb collisions cleanly
+model ShortLink {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  url       String   @unique
+  alias     String?  @unique
+  createdAt DateTime @default(now())
+}
