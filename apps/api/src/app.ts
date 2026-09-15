@@ -196,6 +196,320 @@ export function buildApp(): FastifyInstance {
     }
   });
 
+  // Wallet Clone Implementation — Accounts, deposits, atomic transfers, ledger & idempotency
+  const accountBody = z.object({
+    id: z.string().optional(),
+  });
+
+  const depositBody = z.object({
+    accountId: z.string().min(1),
+    amount: z.number().int().positive(),
+    idempotencyKey: z.string().optional(),
+  });
+
+  const transferBody = z.object({
+    fromAccountId: z.string().min(1),
+    toAccountId: z.string().min(1),
+    amount: z.number().int().positive(),
+    idempotencyKey: z.string().optional(),
+  });
+
+  function deepEqual(a: any, b: any): boolean {
+    if (a === b) return true;
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+      if (Array.isArray(a) !== Array.isArray(b)) return false;
+      const keysA = Object.keys(a);
+      const keysB = Object.keys(b);
+      if (keysA.length !== keysB.length) return false;
+      for (const key of keysA) {
+        if (!keysB.includes(key)) return false;
+        if (!deepEqual(a[key], b[key])) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  app.post('/accounts', async (req, reply) => {
+    const body = accountBody.parse(req.body || {});
+    const idempotencyKey = (req.headers['x-idempotency-key'] as string) || (body as any)?.idempotencyKey;
+
+    if (idempotencyKey) {
+      const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+      if (existing) {
+        if (deepEqual(JSON.parse(existing.requestBody), req.body || {})) {
+          return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+        } else {
+          return reply.code(409).send({ error: 'idempotency_key_conflict' });
+        }
+      }
+    }
+
+    try {
+      const account = await prisma.$transaction(async (tx) => {
+        const acc = await tx.account.create({
+          data: {
+            id: body.id,
+            balance: 0,
+          },
+        });
+
+        if (idempotencyKey) {
+          await tx.idempotency.create({
+            data: {
+              key: idempotencyKey,
+              requestPath: req.url,
+              requestBody: JSON.stringify(req.body || {}),
+              responseStatus: 201,
+              responseBody: JSON.stringify({ id: acc.id, balance: acc.balance }),
+            },
+          });
+        }
+        return acc;
+      });
+
+      return reply.code(201).send({ id: account.id, balance: account.balance });
+    } catch (e) {
+      if (isUniqueViolation(e) && idempotencyKey) {
+        const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+        if (existing) {
+          if (deepEqual(JSON.parse(existing.requestBody), req.body || {})) {
+            return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+          } else {
+            return reply.code(409).send({ error: 'idempotency_key_conflict' });
+          }
+        }
+      }
+      if (isUniqueViolation(e)) {
+        return reply.code(409).send({ error: 'account_already_exists' });
+      }
+      req.log.error({ err: e }, 'account creation failed');
+      return reply.code(500).send({ error: 'account_creation_failed' });
+    }
+  });
+
+  app.post('/deposits', async (req, reply) => {
+    const body = depositBody.parse(req.body);
+    const idempotencyKey = (req.headers['x-idempotency-key'] as string) || body.idempotencyKey;
+
+    if (idempotencyKey) {
+      const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+      if (existing) {
+        if (deepEqual(JSON.parse(existing.requestBody), req.body)) {
+          return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+        } else {
+          return reply.code(409).send({ error: 'idempotency_key_conflict' });
+        }
+      }
+    }
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const account = await tx.account.findUnique({ where: { id: body.accountId } });
+        if (!account) {
+          throw new Error('ACCOUNT_NOT_FOUND');
+        }
+
+        const updated = await tx.account.update({
+          where: { id: body.accountId },
+          data: { balance: { increment: body.amount } },
+        });
+
+        const ledger = await tx.ledgerEntry.create({
+          data: {
+            type: 'DEPOSIT',
+            accountId: body.accountId,
+            amount: body.amount,
+            balanceAfter: updated.balance,
+          },
+        });
+
+        const resData = {
+          id: ledger.id,
+          accountId: body.accountId,
+          amount: body.amount,
+          balanceAfter: updated.balance,
+        };
+
+        if (idempotencyKey) {
+          await tx.idempotency.create({
+            data: {
+              key: idempotencyKey,
+              requestPath: req.url,
+              requestBody: JSON.stringify(req.body),
+              responseStatus: 201,
+              responseBody: JSON.stringify(resData),
+            },
+          });
+        }
+
+        return resData;
+      });
+
+      return reply.code(201).send(result);
+    } catch (e: any) {
+      if (isUniqueViolation(e) && idempotencyKey) {
+        const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+        if (existing) {
+          if (deepEqual(JSON.parse(existing.requestBody), req.body)) {
+            return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+          } else {
+            return reply.code(409).send({ error: 'idempotency_key_conflict' });
+          }
+        }
+      }
+      if (e.message === 'ACCOUNT_NOT_FOUND') {
+        return reply.code(404).send({ error: 'account_not_found' });
+      }
+      req.log.error({ err: e }, 'deposit failed');
+      return reply.code(500).send({ error: 'deposit_failed' });
+    }
+  });
+
+  app.post('/transfers', async (req, reply) => {
+    const body = transferBody.parse(req.body);
+    const idempotencyKey = (req.headers['x-idempotency-key'] as string) || body.idempotencyKey;
+
+    if (body.fromAccountId === body.toAccountId) {
+      return reply.code(400).send({ error: 'invalid_transfer_destination' });
+    }
+
+    if (idempotencyKey) {
+      const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+      if (existing) {
+        if (deepEqual(JSON.parse(existing.requestBody), req.body)) {
+          return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+        } else {
+          return reply.code(409).send({ error: 'idempotency_key_conflict' });
+        }
+      }
+    }
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // 1. Atomic decrement from source using updateMany for concurrency safety
+        const updatedFrom = await tx.account.updateMany({
+          where: { id: body.fromAccountId, balance: { gte: body.amount } },
+          data: { balance: { decrement: body.amount } },
+        });
+
+        if (updatedFrom.count === 0) {
+          const fromExists = await tx.account.findUnique({ where: { id: body.fromAccountId } });
+          if (!fromExists) throw new Error('FROM_ACCOUNT_NOT_FOUND');
+          throw new Error('INSUFFICIENT_FUNDS');
+        }
+
+        // 2. Ensure target exists and increment balance
+        const toExists = await tx.account.findUnique({ where: { id: body.toAccountId } });
+        if (!toExists) throw new Error('TO_ACCOUNT_NOT_FOUND');
+
+        const updatedTo = await tx.account.update({
+          where: { id: body.toAccountId },
+          data: { balance: { increment: body.amount } },
+        });
+
+        // 3. Fetch current balance of fromAccount to log in ledger correctly
+        const fromAccount = await tx.account.findUniqueOrThrow({ where: { id: body.fromAccountId } });
+
+        // 4. Create ledger entries
+        const entryFrom = await tx.ledgerEntry.create({
+          data: {
+            type: 'TRANSFER_OUT',
+            accountId: body.fromAccountId,
+            relatedAccountId: body.toAccountId,
+            amount: body.amount,
+            balanceAfter: fromAccount.balance,
+          },
+        });
+
+        await tx.ledgerEntry.create({
+          data: {
+            type: 'TRANSFER_IN',
+            accountId: body.toAccountId,
+            relatedAccountId: body.fromAccountId,
+            amount: body.amount,
+            balanceAfter: updatedTo.balance,
+          },
+        });
+
+        const resData = {
+          id: entryFrom.id,
+          fromAccountId: body.fromAccountId,
+          toAccountId: body.toAccountId,
+          amount: body.amount,
+          fromBalanceAfter: fromAccount.balance,
+          toBalanceAfter: updatedTo.balance,
+        };
+
+        if (idempotencyKey) {
+          await tx.idempotency.create({
+            data: {
+              key: idempotencyKey,
+              requestPath: req.url,
+              requestBody: JSON.stringify(req.body),
+              responseStatus: 201,
+              responseBody: JSON.stringify(resData),
+            },
+          });
+        }
+
+        return resData;
+      });
+
+      return reply.code(201).send(result);
+    } catch (e: any) {
+      if (isUniqueViolation(e) && idempotencyKey) {
+        const existing = await prisma.idempotency.findUnique({ where: { key: idempotencyKey } });
+        if (existing) {
+          if (deepEqual(JSON.parse(existing.requestBody), req.body)) {
+            return reply.code(existing.responseStatus).send(JSON.parse(existing.responseBody));
+          } else {
+            return reply.code(409).send({ error: 'idempotency_key_conflict' });
+          }
+        }
+      }
+      if (e.message === 'FROM_ACCOUNT_NOT_FOUND') {
+        return reply.code(404).send({ error: 'from_account_not_found' });
+      }
+      if (e.message === 'TO_ACCOUNT_NOT_FOUND') {
+        return reply.code(404).send({ error: 'to_account_not_found' });
+      }
+      if (e.message === 'INSUFFICIENT_FUNDS') {
+        return reply.code(400).send({ error: 'insufficient_funds' });
+      }
+      req.log.error({ err: e }, 'transfer failed');
+      return reply.code(500).send({ error: 'transfer_failed' });
+    }
+  });
+
+  app.get('/accounts/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+
+    const account = await prisma.account.findUnique({ where: { id } });
+    if (!account) {
+      return reply.code(404).send({ error: 'account_not_found' });
+    }
+
+    const ledger = await prisma.ledgerEntry.findMany({
+      where: { accountId: id },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return reply.send({
+      id: account.id,
+      balance: account.balance,
+      ledger: ledger.map((entry) => ({
+        id: entry.id,
+        type: entry.type,
+        accountId: entry.accountId,
+        relatedAccountId: entry.relatedAccountId,
+        amount: entry.amount,
+        balanceAfter: entry.balanceAfter,
+        createdAt: entry.createdAt,
+      })),
+    });
+  });
+
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
