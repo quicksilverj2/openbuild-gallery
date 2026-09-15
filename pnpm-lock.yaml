@@ -18,7 +18,7 @@ importers:
         specifier: ^10.0.1
         version: 10.1.0
       '@prisma/client':
-        specifier: ^6.2.1
+        specifier: ^6.19.3
         version: 6.19.3(prisma@6.19.3(typescript@5.9.3))(typescript@5.9.3)
       fastify:
         specifier: ^5.2.0
@@ -31,7 +31,7 @@ importers:
         specifier: ^22.10.2
         version: 22.20.1
       prisma:
-        specifier: ^6.2.1
+        specifier: ^6.19.3
         version: 6.19.3(typescript@5.9.3)
       tsx:
         specifier: ^4.19.2

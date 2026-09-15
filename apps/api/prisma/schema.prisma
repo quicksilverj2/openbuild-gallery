@@ -66,3 +66,24 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model Shortlink {
+  code      String   @id
+  url       String
+  lookupKey String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([url])
+}
+
+model Paste {
+  id             String    @id @default(cuid())
+  content        String
+  views_allowed  Int
+  views_remaining Int
+  expiresAt      DateTime
+  createdAt      DateTime  @default(now())
+
+  @@index([views_remaining])
+  @@index([expiresAt])
+}
