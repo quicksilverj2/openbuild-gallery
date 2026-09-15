@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
+import crypto from 'node:crypto';
 import { prisma } from './db';
 
 /**
@@ -45,6 +46,22 @@ const voteBody = z.object({
   voterId: z.string().min(1),
   idempotencyKey: z.string().min(1),
 });
+
+const shortenBody = z.object({
+  url: z.string().url(),
+  alias: z.string().regex(/^[a-zA-Z0-9-_]+$/).min(1).max(100).optional(),
+});
+
+const ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+function generateRandomCode(length = 6): string {
+  let result = '';
+  const bytes = crypto.randomBytes(length);
+  for (let i = 0; i < length; i++) {
+    const byte = bytes[i] ?? 0;
+    result += ALPHABET[byte % ALPHABET.length];
+  }
+  return result;
+}
 
 export function buildApp(): FastifyInstance {
   const app = Fastify({
@@ -194,6 +211,47 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  app.post('/shorten', async (req, reply) => {
+    const body = shortenBody.parse(req.body);
+    const lookupKey = body.alias ?? `default:${body.url}`;
+
+    const code = generateRandomCode(6);
+    try {
+      const shortlink = await prisma.shortlink.create({
+        data: {
+          code,
+          url: body.url,
+          lookupKey,
+        },
+      });
+      req.log.info({ event: 'shortlink.created', code: shortlink.code, url: body.url, lookupKey }, 'shortlink created');
+      return reply.code(201).send({ code: shortlink.code });
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+
+      const existing = await prisma.shortlink.findUnique({
+        where: { lookupKey },
+      });
+      if (existing) {
+        req.log.info({ event: 'shortlink.idempotent_resolve', code: existing.code, url: body.url, lookupKey }, 'shortlink resolved to existing');
+        return reply.code(200).send({ code: existing.code });
+      }
+      throw e;
+    }
+  });
+
+  app.get('/:code', async (req, reply) => {
+    const { code } = z.object({ code: z.string() }).parse(req.params);
+    const shortlink = await prisma.shortlink.findUnique({
+      where: { code },
+    });
+    if (!shortlink) {
+      return reply.code(404).send({ error: 'shortlink_not_found' });
+    }
+    req.log.info({ event: 'shortlink.redirect', code, url: shortlink.url }, 'redirecting');
+    return reply.redirect(shortlink.url);
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
