@@ -66,3 +66,12 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model Shortlink {
+  code      String   @id
+  url       String
+  lookupKey String   @unique // alias OR "default:" + url
+  createdAt DateTime @default(now())
+
+  @@index([url])
+}
