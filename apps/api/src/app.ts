@@ -196,6 +196,88 @@ export function buildApp(): FastifyInstance {
     }
   });
 
+  app.get('/:code', async (req, reply) => {
+    const { code } = z.object({ code: z.string() }).parse(req.params);
+    const shortlink = await prisma.shortlink.findUnique({
+      where: { code },
+    });
+    if (!shortlink) {
+      return reply.code(404).send({ error: 'shortlink_not_found' });
+    }
+    req.log.info({ event: 'shortlink.redirect', code, url: shortlink.url }, 'redirecting');
+    return reply.redirect(shortlink.url);
+  });
+
+  const pasteBody = z.object({
+    content: z.string().min(1),
+    views_allowed: z.number().int().min(1).max(100),
+    ttl_seconds: z.number().int().min(1).max(86400),
+  });
+
+  app.post('/pastes', async (req, reply) => {
+    const body = pasteBody.parse(req.body);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + body.ttl_seconds * 1000);
+
+    try {
+      const paste = await prisma.paste.create({
+        data: {
+          content: body.content,
+          views_allowed: body.views_allowed,
+          views_remaining: body.views_allowed,
+          expiresAt,
+        },
+      });
+      req.log.info({ event: 'paste.created', id: paste.id, views_allowed: paste.views_allowed, ttl: body.ttl_seconds }, 'paste created');
+      return reply.code(201).send({ id: paste.id });
+    } catch (e) {
+      req.log.error({ err: e }, 'paste creation failed');
+      return reply.code(500).send({ error: 'paste_creation_failed' });
+    }
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string().uuid().or(z.string().min(1)) }).parse(req.params);
+
+    // Atomically decrement views_remaining and return the paste if views were available.
+    // Key concurrency invariant: 20 concurrent reads of a 1-view paste → exactly one gets content.
+    // We use updateMany with a where clause to ensure only one request succeeds.
+    try {
+      const result = await prisma.paste.updateMany({
+        where: { id, views_remaining: { gt: 0 } },
+        data: { views_remaining: { decrement: 1 } },
+      });
+
+      if (result.count === 0) {
+        // No paste with views remaining or paste not found
+        const paste = await prisma.paste.findUnique({ where: { id } });
+        if (!paste) {
+          return reply.code(404).send({ error: 'paste_not_found' });
+        }
+        // Paste exists but views exhausted or expired
+        if (paste.views_remaining <= 0 || paste.expiresAt <= new Date()) {
+          return reply.code(410).send({ error: 'paste_consumed_or_expired' });
+        }
+        return reply.code(404).send({ error: 'paste_not_available' });
+      }
+
+      // Successfully decremented — fetch the paste and return content
+      const paste = await prisma.paste.findUnique({ where: { id } });
+      if (!paste || paste.expiresAt <= new Date()) {
+        return reply.code(404).send({ error: 'paste_not_found_or_expired' });
+      }
+
+      req.log.info({ event: 'paste.read', id, remaining: paste.views_remaining }, 'paste read');
+      return reply.send(paste.content);
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2025') {
+        return reply.code(404).send({ error: 'paste_not_found' });
+      }
+      req.log.error({ err: e }, 'paste read failed');
+      return reply.code(500).send({ error: 'paste_read_failed' });
+    }
+  });
+
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
