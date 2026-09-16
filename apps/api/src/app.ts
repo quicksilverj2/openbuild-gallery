@@ -197,6 +197,51 @@ export function buildApp(): FastifyInstance {
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
+
+  // Voucher clone endpoints
+  const createVoucherBody = z.object({
+    code: z.string().min(1),
+  });
+
+  const redeemBody = z.object({
+    code: z.string().min(1),
+    userId: z.string().min(1),
+    idempotencyKey: z.string().min(1),
+  });
+
+  app.post('/vouchers', async (req, reply) => {
+    const body = createVoucherBody.parse(req.body);
+    try {
+      const voucher = await prisma.voucher.create({ data: { code: body.code } });
+      req.log.info({ event: 'voucher.created', code: voucher.code }, 'voucher created');
+      return reply.code(201).send({ id: voucher.id, code: voucher.code, redeemed: voucher.redeemed });
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+      return reply.code(409).send({ error: 'voucher_code_exists' });
+    }
+  });
+
+  app.post('/vouchers/redeem', async (req, reply) => {
+    const body = redeemBody.parse(req.body);
+    const voucher = await prisma.voucher.findUnique({ where: { code: body.code } });
+    if (!voucher) return reply.code(404).send({ error: 'voucher_not_found' });
+
+    if (voucher.redeemed) {
+      req.log.warn({ event: 'voucher.already_redeemed', code: body.code }, 'voucher already redeemed');
+      return reply.code(409).send({ error: 'already_redeemed' });
+    }
+
+    const updated = await prisma.voucher.updateMany({
+      where: { id: voucher.id, redeemed: false },
+      data: { redeemed: true, redeemedBy: body.userId, redeemedAt: new Date() },
+    });
+    if (updated.count === 0) {
+      req.log.info({ event: 'voucher.race_lost', code: body.code }, 'voucher race lost');
+      return reply.code(409).send({ error: 'already_redeemed' });
+    }
+    req.log.info({ event: 'voucher.redeemed', code: body.code, userId: body.userId }, 'voucher redeemed');
+    return reply.code(200).send({ status: 'redeemed' });
+  });
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
       return reply.code(400).send({ error: 'validation_error', details: err.flatten() });
