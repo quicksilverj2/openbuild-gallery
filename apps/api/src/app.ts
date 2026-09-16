@@ -230,6 +230,41 @@ export function buildApp(): FastifyInstance {
       request.cloneSlug = params.slug;
     }
   });
+  // Reset endpoint for deterministic preview seeding
+  app.post('/reset', async (req, reply) => {
+    const token = req.headers['x-reset-token'] as string | undefined;
+    if (!token || token !== process.env.RESET_TOKEN) {
+      req.log.warn({ event: 'reset.unauthorized' }, 'unauthorized reset attempt');
+      return reply.code(403).send({ error: 'unauthorized' });
+    }
+    // Delete all mutable data
+    await prisma.$transaction([
+      prisma.vote.deleteMany(),
+      prisma.option.deleteMany(),
+      prisma.poll.deleteMany(),
+      prisma.shortlink.deleteMany(),
+      prisma.paste.deleteMany(),
+      prisma.inventoryItem.deleteMany(),
+      prisma.reservation.deleteMany(),
+      prisma.voucher.deleteMany(),
+      prisma.account.deleteMany(),
+      prisma.ledgerEntry.deleteMany(),
+    ]);
+    // Re-seed default clone
+    await prisma.clone.upsert({
+      where: { slug: 'poll' },
+      update: {},
+      create: {
+        slug: 'poll',
+        title: 'Poll',
+        summary: 'Create a question, vote once, watch a live tally. Correct under concurrent load.',
+        demoPath: '/clones/poll',
+      },
+    });
+    req.log.info({ event: 'reset.completed' }, 'preview reset completed');
+    return reply.code(200).send({ status: 'reset' });
+  });
+
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
       return reply.code(400).send({ error: 'validation_error', details: err.flatten() });
