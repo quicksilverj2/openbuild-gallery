@@ -66,3 +66,95 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model Shortlink {
+  code      String   @id
+  url       String
+  lookupKey String   @unique // alias OR "default:" + url
+  createdAt DateTime @default(now())
+
+  @@index([url])
+}
+
+model Paste {
+  id             String   @id @default(cuid())
+  content        String
+  viewsAllowed   Int
+  viewsRemaining Int
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@index([expiresAt])
+  @@index([viewsRemaining])
+}
+
+model Account {
+  id        String   @id @default(cuid())
+  balance   BigInt   @default(0)
+  createdAt DateTime @default(now())
+  ledger    LedgerEntry[]
+}
+
+model LedgerEntry {
+  id              String        @id @default(cuid())
+  accountId       String
+  type            LedgerType
+  amount          BigInt
+  counterpartyId  String?
+  idempotencyKey  String
+  createdAt       DateTime      @default(now())
+  account         Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, idempotencyKey])
+  @@index([accountId])
+}
+
+enum LedgerType {
+  DEPOSIT
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+model InventoryItem {
+  id          String   @id @default(cuid())
+  sku         String   @unique
+  name        String
+  totalQty    Int
+  reservedQty Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  reservations Reservation[]
+
+  @@index([sku])
+}
+
+model Reservation {
+  id              String   @id @default(cuid())
+  inventoryItemId String
+  qty             Int
+  idempotencyKey  String
+  status          ReservationStatus @default(ACTIVE)
+  createdAt       DateTime @default(now())
+  releasedAt      DateTime?
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([inventoryItemId, idempotencyKey])
+  @@index([inventoryItemId])
+  @@index([status])
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+}
+
+model Voucher {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  redeemed    Boolean  @default(false)
+  redeemedBy  String?
+  redeemedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([code])
+}
