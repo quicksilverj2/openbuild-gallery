@@ -46,6 +46,21 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const createInventoryBody = z.object({
+  sku: z.string().min(1).max(50),
+  name: z.string().min(1).max(100),
+  totalQty: z.number().int().positive(),
+});
+
+const reserveBody = z.object({
+  qty: z.number().int().positive(),
+  idempotencyKey: z.string().min(1).max(100),
+});
+
+const releaseBody = z.object({
+  idempotencyKey: z.string().min(1).max(100),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -194,6 +209,116 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  // Inventory clone endpoints
+  app.post('/inventory', async (req, reply) => {
+    const body = createInventoryBody.parse(req.body);
+    try {
+      const item = await prisma.inventoryItem.create({
+        data: {
+          sku: body.sku,
+          name: body.name,
+          totalQty: body.totalQty,
+        },
+      });
+      req.log.info({ event: 'inventory.created', sku: item.sku, totalQty: item.totalQty }, 'inventory item created');
+      return reply.code(201).send({ id: item.id, sku: item.sku, name: item.name, totalQty: item.totalQty, availableQty: item.totalQty });
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+      return reply.code(409).send({ error: 'sku_already_exists' });
+    }
+  });
+
+  app.get('/inventory/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const item = await prisma.inventoryItem.findUnique({ where: { id } });
+    if (!item) return reply.code(404).send({ error: 'item_not_found' });
+    return { id: item.id, sku: item.sku, name: item.name, totalQty: item.totalQty, reservedQty: item.reservedQty, availableQty: item.totalQty - item.reservedQty };
+  });
+
+  app.post('/inventory/:id/reserve', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const body = reserveBody.parse(req.body);
+
+    // Check if item exists
+    const item = await prisma.inventoryItem.findUnique({ where: { id } });
+    if (!item) return reply.code(404).send({ error: 'item_not_found' });
+
+    // Check idempotency key first
+    const existingReservation = await prisma.reservation.findUnique({
+      where: { inventoryItemId_idempotencyKey: { inventoryItemId: id, idempotencyKey: body.idempotencyKey } },
+    });
+    if (existingReservation) {
+      if (existingReservation.status === 'ACTIVE') {
+        if (existingReservation.qty !== body.qty) {
+          req.log.warn({ event: 'reservation.key_conflict', inventoryItemId: id, idempotencyKey: body.idempotencyKey }, 'idempotency key reused with different qty');
+          return reply.code(409).send({ error: 'idempotency_key_conflict' });
+        }
+        req.log.info({ event: 'reservation.idempotent_replay', inventoryItemId: id, idempotencyKey: body.idempotencyKey }, 'idempotent replay');
+        return reply.code(200).send({ status: 'duplicate_ignored', reservationId: existingReservation.id, qty: existingReservation.qty });
+      } else {
+        req.log.warn({ event: 'reservation.key_conflict', inventoryItemId: id, idempotencyKey: body.idempotencyKey }, 'idempotency key reused with released reservation');
+        return reply.code(409).send({ error: 'idempotency_key_conflict' });
+      }
+    }
+
+    // Atomic reservation: only succeed if enough available quantity
+    const updated = await prisma.inventoryItem.updateMany({
+      where: {
+        id,
+        reservedQty: { lte: item.totalQty - body.qty },
+      },
+      data: { reservedQty: { increment: body.qty } },
+    });
+
+    if (updated.count === 0) {
+      req.log.info({ event: 'reservation.insufficient_stock', inventoryItemId: id, requestedQty: body.qty, availableQty: item.totalQty - item.reservedQty }, 'insufficient stock');
+      return reply.code(409).send({ error: 'insufficient_stock', availableQty: item.totalQty - item.reservedQty });
+    }
+
+    // Create reservation record
+    const reservation = await prisma.reservation.create({
+      data: {
+        inventoryItemId: id,
+        qty: body.qty,
+        idempotencyKey: body.idempotencyKey,
+        status: 'ACTIVE',
+      },
+    });
+
+    req.log.info({ event: 'reservation.created', inventoryItemId: id, reservationId: reservation.id, qty: body.qty }, 'reservation created');
+    return reply.code(201).send({ reservationId: reservation.id, qty: body.qty });
+  });
+
+  app.post('/inventory/:id/release', async (req, reply) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const body = releaseBody.parse(req.body);
+
+    const reservation = await prisma.reservation.findUnique({
+      where: { inventoryItemId_idempotencyKey: { inventoryItemId: id, idempotencyKey: body.idempotencyKey } },
+    });
+
+    if (!reservation) return reply.code(404).send({ error: 'reservation_not_found' });
+    if (reservation.status === 'RELEASED') {
+      req.log.info({ event: 'reservation.idempotent_release_replay', inventoryItemId: id, idempotencyKey: body.idempotencyKey }, 'idempotent release replay');
+      return reply.code(200).send({ status: 'already_released' });
+    }
+
+    // Atomic release: decrement reservedQty and mark reservation as released
+    await prisma.$transaction([
+      prisma.inventoryItem.update({
+        where: { id },
+        data: { reservedQty: { decrement: reservation.qty } },
+      }),
+      prisma.reservation.update({
+        where: { id: reservation.id },
+        data: { status: 'RELEASED', releasedAt: new Date() },
+      }),
+    ]);
+
+    req.log.info({ event: 'reservation.released', inventoryItemId: id, reservationId: reservation.id, qty: reservation.qty }, 'reservation released');
+    return reply.code(200).send({ status: 'released', qty: reservation.qty });
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
