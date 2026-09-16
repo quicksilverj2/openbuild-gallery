@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { prisma } from '../src/db';
@@ -8,6 +8,10 @@ let app: FastifyInstance;
 beforeAll(async () => {
   app = buildApp();
   await app.ready();
+});
+
+beforeEach(async () => {
+  await prisma.shortlink.deleteMany();
 });
 
 afterAll(async () => {
