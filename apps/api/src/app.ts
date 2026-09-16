@@ -75,8 +75,34 @@ export function buildApp(): FastifyInstance {
     }
   });
 
-  // Minimal Prometheus-style metrics: enough for the observability bounty to build on.
-  app.get('/metrics', async (_req, reply) => {
+  // Enhanced Prometheus-style metrics: supports global and per-clone metrics.
+  app.get('/metrics', async (req, reply) => {
+    const { cloneSlug } = req.query as { cloneSlug?: string };
+    if (cloneSlug) {
+      // Per-clone metrics
+      const [cloneExists, polls, votes] = await Promise.all([
+        prisma.clone.findUnique({ where: { slug: cloneSlug } }),
+        prisma.poll.count({ where: { cloneSlug } }),
+        prisma.vote.count({ where: { poll: { cloneSlug } } }),
+      ]);
+      if (!cloneExists) return reply.code(404).send({ error: 'clone_not_found' });
+      reply.header('content-type', 'text/plain; version=0.0.4');
+      return [
+        `# HELP openbuild_clone_info Information about clone`,
+        `# TYPE openbuild_clone_info gauge`,
+        `openbuild_clone_info{slug="${cloneSlug}"} 1`,
+        '',
+        `# HELP openbuild_clone_polls_total Number of polls in clone`,
+        `# TYPE openbuild_clone_polls_total counter`,
+        `openbuild_clone_polls_total{slug="${cloneSlug}"} ${polls}`,
+        '',
+        `# HELP openbuild_clone_votes_total Number of votes in clone`,
+        `# TYPE openbuild_clone_votes_total counter`,
+        `openbuild_clone_votes_total{slug="${cloneSlug}"} ${votes}`,
+        '',
+      ].join('\n');
+    }
+    // Global metrics (fallback)
     const [clones, polls, votes] = await Promise.all([
       prisma.clone.count(),
       prisma.poll.count(),
@@ -196,7 +222,49 @@ export function buildApp(): FastifyInstance {
     }
   });
 
-  // Uniform 400 for validation failures so the probe never sees a spurious 500.
+  // Middleware to capture clone slug from route params for downstream logging/metrics
+  app.addHook('preHandler', async (request, reply) => {
+    const params = request.params as Record<string, any>;
+    if (params && typeof params.slug === 'string') {
+      // @ts-ignore extend request with cloneSlug
+      request.cloneSlug = params.slug;
+    }
+  });
+  // Reset endpoint for deterministic preview seeding
+  app.post('/reset', async (req, reply) => {
+    const token = req.headers['x-reset-token'] as string | undefined;
+    if (!token || token !== process.env.RESET_TOKEN) {
+      req.log.warn({ event: 'reset.unauthorized' }, 'unauthorized reset attempt');
+      return reply.code(403).send({ error: 'unauthorized' });
+    }
+    // Delete all mutable data
+    await prisma.$transaction([
+      prisma.vote.deleteMany(),
+      prisma.option.deleteMany(),
+      prisma.poll.deleteMany(),
+      prisma.shortlink.deleteMany(),
+      prisma.paste.deleteMany(),
+      prisma.inventoryItem.deleteMany(),
+      prisma.reservation.deleteMany(),
+      prisma.voucher.deleteMany(),
+      prisma.account.deleteMany(),
+      prisma.ledgerEntry.deleteMany(),
+    ]);
+    // Re-seed default clone
+    await prisma.clone.upsert({
+      where: { slug: 'poll' },
+      update: {},
+      create: {
+        slug: 'poll',
+        title: 'Poll',
+        summary: 'Create a question, vote once, watch a live tally. Correct under concurrent load.',
+        demoPath: '/clones/poll',
+      },
+    });
+    req.log.info({ event: 'reset.completed' }, 'preview reset completed');
+    return reply.code(200).send({ status: 'reset' });
+  });
+
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof z.ZodError) {
       return reply.code(400).send({ error: 'validation_error', details: err.flatten() });

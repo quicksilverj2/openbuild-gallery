@@ -6,6 +6,7 @@ import { prisma } from '../src/db';
 let app: FastifyInstance;
 
 beforeAll(async () => {
+  process.env.DATABASE_URL = 'postgresql://decepticon:decepticon@127.0.0.1:5432/app?schema=public';
   app = buildApp();
   await app.ready();
   await prisma.clone.upsert({
