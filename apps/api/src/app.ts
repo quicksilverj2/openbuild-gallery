@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyRequest, type FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
@@ -63,6 +63,94 @@ export function buildApp(): FastifyInstance {
   app.register(cors, {
     origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
   });
+
+  // Rate limit configuration (can be extended per-clone via Clone model)
+  const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+  const DEFAULT_RATE_LIMIT = 60; // 60 requests per minute
+
+  // Helper to get client IP
+  function getClientIp(req: FastifyRequest): string {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded) {
+      const ip = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0];
+      return (ip ?? 'unknown').trim();
+    }
+    return (req.ip as string) ?? 'unknown';
+  }
+
+  // Rate limit middleware factory
+  function createRateLimiter(options: { limit?: number; windowMs?: number; keyPrefix?: string }) {
+    const limit = options.limit ?? DEFAULT_RATE_LIMIT;
+    const windowMs = options.windowMs ?? RATE_LIMIT_WINDOW_MS;
+    const keyPrefix = options.keyPrefix ?? 'global';
+
+    return async (req: FastifyRequest, reply: FastifyReply) => {
+      const ip = getClientIp(req);
+      const cloneSlug = (req as any).cloneSlug ?? 'global';
+      const key = `${keyPrefix}:${ip}:${cloneSlug}`;
+      const now = new Date();
+      const windowStart = new Date(now.getTime() - (now.getTime() % windowMs));
+      const windowEnd = new Date(windowStart.getTime() + windowMs);
+
+      try {
+        // Atomic upsert using raw SQL for true concurrency safety
+        // Single statement: insert or update atomically with window check
+        // Note: Database columns are camelCase (windowStart, expiresAt)
+        // Use gen_random_uuid() for id since the column lacks a default
+        const result = await prisma.$queryRaw<[{ count: number; expiresAt: Date }]>`
+          INSERT INTO "RateLimit" (id, key, count, "windowStart", "expiresAt")
+          VALUES (gen_random_uuid(), ${key}, 1, ${windowStart}, ${windowEnd})
+          ON CONFLICT (key) DO UPDATE SET
+            count = CASE
+              WHEN "RateLimit"."windowStart" = ${windowStart} THEN "RateLimit".count + 1
+              ELSE 1
+            END,
+            "windowStart" = CASE
+              WHEN "RateLimit"."windowStart" = ${windowStart} THEN "RateLimit"."windowStart"
+              ELSE ${windowStart}
+            END,
+            "expiresAt" = ${windowEnd}
+          RETURNING count, "expiresAt"
+        `;
+
+        const row = result[0];
+        const count = row.count;
+        const allowed = count <= limit;
+        const retryAfterMs = row.expiresAt.getTime() - now.getTime();
+
+        if (!allowed) {
+          req.log.warn({ event: 'rate_limit.exceeded', key, count, limit }, 'rate limit exceeded');
+          return reply
+            .code(429)
+            .header('Retry-After', Math.ceil(retryAfterMs / 1000))
+            .header('X-RateLimit-Limit', limit)
+            .header('X-RateLimit-Remaining', 0)
+            .send({ error: 'rate_limit_exceeded', retryAfter: Math.ceil(retryAfterMs / 1000) });
+        }
+
+        // Add rate limit headers
+        reply.header('X-RateLimit-Limit', limit);
+        reply.header('X-RateLimit-Remaining', Math.max(0, limit - count));
+      } catch (e) {
+        // On DB error, throw for debugging (remove in production for fail-open)
+        req.log.error({ err: e, event: 'rate_limit.error' }, 'rate limiter error');
+        throw e;
+      }
+    };
+  }
+
+  // Apply rate limiter only to routes that opt-in via route config
+  // app.addHook('preHandler', createRateLimiter({ keyPrefix: 'api' }));
+
+  // Test route for rate limiter (opt-in) - creates limiter per request to allow dynamic config via query params
+  app.get('/rate-limit-test', async (request, reply) => {
+    const query = request.query as { limit?: string; window?: string };
+    const limit = Number(query.limit) || 10;
+    const windowMs = (Number(query.window) || 60) * 1000;
+    const rateLimit = createRateLimiter({ limit, windowMs, keyPrefix: 'test' });
+    return rateLimit(request, reply);
+  });
+
 
   app.get('/healthz', async () => ({ status: 'ok' }));
 
@@ -242,13 +330,7 @@ export function buildApp(): FastifyInstance {
       prisma.vote.deleteMany(),
       prisma.option.deleteMany(),
       prisma.poll.deleteMany(),
-      prisma.shortlink.deleteMany(),
-      prisma.paste.deleteMany(),
-      prisma.inventoryItem.deleteMany(),
-      prisma.reservation.deleteMany(),
-      prisma.voucher.deleteMany(),
-      prisma.account.deleteMany(),
-      prisma.ledgerEntry.deleteMany(),
+      prisma.rateLimit.deleteMany(),
     ]);
     // Re-seed default clone
     await prisma.clone.upsert({

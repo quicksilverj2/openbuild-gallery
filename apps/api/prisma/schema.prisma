@@ -66,3 +66,13 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+model RateLimit {
+  id        String   @id @default(cuid())
+  key       String   @unique // composite: "ip:cloneSlug" or "ip:global"
+  count     Int      @default(0)
+  windowStart DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}

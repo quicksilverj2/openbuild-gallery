@@ -17,8 +17,22 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // Reset DB before each test to ensure clean state
-  await app.inject({ method: 'POST', url: '/reset', headers: { 'x-reset-token': 'test-token' } });
+  // Reset DB before each test to ensure clean state - direct Prisma cleanup
+  await prisma.vote.deleteMany();
+  await prisma.option.deleteMany();
+  await prisma.poll.deleteMany();
+  await prisma.rateLimit.deleteMany();
+  // Re-seed default clone
+  await prisma.clone.upsert({
+    where: { slug: 'poll' },
+    update: {},
+    create: {
+      slug: 'poll',
+      title: 'Poll',
+      summary: 'Create a question, vote once, watch a live tally. Correct under concurrent load.',
+      demoPath: '/clones/poll',
+    },
+  });
 });
 
 describe('reset endpoint', () => {

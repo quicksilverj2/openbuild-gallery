@@ -11,7 +11,7 @@
     "start": "tsx src/server.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --pool=forks --poolOptions.forks.singleFork=true",
     "generate": "prisma generate",
     "migrate:dev": "prisma migrate dev",
     "migrate:deploy": "prisma migrate deploy",
