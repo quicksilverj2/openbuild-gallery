@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { prisma } from '../src/db';
@@ -6,6 +6,7 @@ import { prisma } from '../src/db';
 let app: FastifyInstance;
 
 beforeAll(async () => {
+  process.env.DATABASE_URL = 'postgresql://decepticon:decepticon@127.0.0.1:5432/app?schema=public';
   app = buildApp();
   await app.ready();
   await prisma.clone.upsert({
@@ -18,6 +19,13 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   await prisma.$disconnect();
+});
+
+beforeEach(async () => {
+  // Clean up polls, options, votes after each test to ensure isolation
+  await prisma.vote.deleteMany();
+  await prisma.option.deleteMany();
+  await prisma.poll.deleteMany();
 });
 
 async function newPoll(): Promise<{ pollId: string; optionA: string; optionB: string }> {
