@@ -15,7 +15,18 @@ async function main() {
       demoPath: '/clones/poll',
     },
   });
-  console.log('seeded clone: poll');
+  await prisma.clone.upsert({
+    where: { slug: 'paste' },
+    update: {},
+    create: {
+      slug: 'paste',
+      title: 'Paste',
+      summary:
+        'Share text with a view limit and a TTL. Exactly N reads are served, even under a burst.',
+      demoPath: '/clones/paste',
+    },
+  });
+  console.log('seeded clones: poll, paste');
 }
 
 main()

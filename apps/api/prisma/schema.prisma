@@ -66,3 +66,19 @@ model Vote {
   @@unique([pollId, idempotencyKey])
   @@index([pollId])
 }
+
+// Paste clone (view-once / limited views). viewsRemaining is decremented with a
+// single conditional UPDATE (WHERE viewsRemaining > 0 AND not expired), so
+// concurrent readers cannot over-serve: Postgres row locking serialises them and
+// the losers see 0 affected rows -> 404. Content is immutable after creation.
+model Paste {
+  id             String   @id @default(cuid())
+  cloneSlug      String
+  content        String
+  viewsAllowed   Int
+  viewsRemaining Int
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@index([cloneSlug])
+}

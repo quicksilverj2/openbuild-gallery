@@ -46,6 +46,16 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const createPasteBody = z.object({
+  content: z.string().min(1).max(10_000),
+  viewsAllowed: z.number().int().min(1).max(1000),
+  ttlSeconds: z
+    .number()
+    .int()
+    .min(1)
+    .max(7 * 24 * 3600),
+});
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -194,6 +204,57 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  // ---- Paste clone: limited-view pastes -------------------------------------
+  // POST /clones/:slug/pastes  { content, viewsAllowed, ttlSeconds } -> 201 {id,...}
+  // GET  /pastes/:id           -> 200 {content, viewsRemaining} | 404 (missing/expired/exhausted)
+  app.post('/clones/:slug/pastes', async (req, reply) => {
+    const { slug } = z.object({ slug: z.string() }).parse(req.params);
+    const body = createPasteBody.parse(req.body);
+    const clone = await prisma.clone.findUnique({ where: { slug } });
+    if (!clone) return reply.code(404).send({ error: 'clone_not_found' });
+
+    const paste = await prisma.paste.create({
+      data: {
+        cloneSlug: slug,
+        content: body.content,
+        viewsAllowed: body.viewsAllowed,
+        viewsRemaining: body.viewsAllowed,
+        expiresAt: new Date(Date.now() + body.ttlSeconds * 1000),
+      },
+    });
+    req.log.info(
+      { event: 'paste.created', pasteId: paste.id, viewsAllowed: paste.viewsAllowed },
+      'paste created',
+    );
+    return reply.code(201).send({
+      id: paste.id,
+      viewsAllowed: paste.viewsAllowed,
+      expiresAt: paste.expiresAt.toISOString(),
+    });
+  });
+
+  app.get('/pastes/:id', async (req, reply) => {
+    const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
+    reply.header('cache-control', 'no-store');
+
+    // The gate. One conditional UPDATE: only a request that still sees
+    // viewsRemaining > 0 on an unexpired paste wins a view. Postgres re-evaluates
+    // the WHERE after taking the row lock, so exactly viewsAllowed readers win.
+    const won = await prisma.paste.updateMany({
+      where: { id, viewsRemaining: { gt: 0 }, expiresAt: { gt: new Date() } },
+      data: { viewsRemaining: { decrement: 1 } },
+    });
+    if (won.count !== 1) {
+      req.log.info({ event: 'paste.unavailable', pasteId: id }, 'paste missing/expired/exhausted');
+      return reply.code(404).send({ error: 'paste_not_found' });
+    }
+    // Content is immutable, so reading it after winning the view is race-free.
+    const paste = await prisma.paste.findUnique({ where: { id } });
+    if (!paste) return reply.code(404).send({ error: 'paste_not_found' });
+    req.log.info({ event: 'paste.served', pasteId: id }, 'paste view served');
+    return { id: paste.id, content: paste.content, viewsAllowed: paste.viewsAllowed };
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
