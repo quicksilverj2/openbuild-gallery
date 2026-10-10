@@ -16,6 +16,18 @@ async function main() {
     },
   });
   console.log('seeded clone: poll');
+
+  await prisma.clone.upsert({
+    where: { slug: 'shortlink' },
+    update: {},
+    create: {
+      slug: 'shortlink',
+      title: 'Shortlink',
+      summary: 'Deduplicated, non-enumerable URL shortener. Correct under concurrent load.',
+      demoPath: '/clones/shortlink',
+    },
+  });
+  console.log('seeded clone: shortlink');
 }
 
 main()

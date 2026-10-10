@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Live concurrency probe for the Poll clone — the same "reproduce under load"
-// gate used on the take-homes, pointed at a running server (local or a PR preview).
+// Live concurrency probe for the Gallery clones (Poll, Shortlink, ...) — the same
+// "reproduce under load" gate used on the take-homes, pointed at a running server.
 //
 //   node probes/concurrency.mjs http://localhost:3000
 //
@@ -118,11 +118,35 @@ async function scenarioDistinctVoters() {
   else fail(`expected tally total ${N}, got ${json.tally.total}`);
 }
 
+async function scenarioShortlinkBurst() {
+  const url = `https://invariant.test/probe-${id('url')}`;
+  const burstN = 20;
+  const results = await Promise.all(
+    Array.from({ length: burstN }, () => jpost('/shorten', { url })),
+  );
+  const statuses = results.map((r) => r.status);
+  const d = dist(statuses);
+  console.log(
+    `\n[shortlink concurrent burst × ${burstN}] status distribution: ${JSON.stringify(d)}`,
+  );
+  if (statuses.some((s) => s >= 500)) fail('server returned a 5xx under shortlink burst');
+  else ok('no 5xx');
+  if (d[201] === 1) ok('exactly one shortlink created (201)');
+  else fail(`expected exactly one 201, got ${d[201] ?? 0}`);
+  if (d[200] === burstN - 1) ok('all concurrent requests resolved to winner (200)');
+  else fail(`expected ${burstN - 1} 200s, got ${d[200] ?? 0}`);
+
+  const codes = new Set(results.map((r) => r.json?.code));
+  if (codes.size === 1) ok('all requests returned identical code');
+  else fail(`expected 1 unique code, got ${codes.size}`);
+}
+
 console.log(`Concurrency probe → ${BASE} (burst=${N})`);
 try {
   await scenarioSameVoter();
   await scenarioIdempotentRetry();
   await scenarioDistinctVoters();
+  await scenarioShortlinkBurst();
 } catch (e) {
   console.error(`\nprobe aborted: ${e.message}`);
   process.exit(2);
