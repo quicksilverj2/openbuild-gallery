@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import { Prisma } from '@prisma/client';
@@ -5,13 +6,13 @@ import { z } from 'zod';
 import { prisma } from './db';
 
 /**
- * OpenBuild Gallery API — the seed product is a "Poll" clone.
+ * OpenBuild Gallery API — the seed product is a "Poll" clone, and the
+ * "Shortlink" clone adds concurrency-safe URL shortening with deduplication.
  *
- * The interesting endpoint is POST /polls/:id/votes. Its whole job is to stay
- * correct under a concurrent burst: one vote per voter, safe client retries,
- * and NEVER a 5xx just because two requests raced. See prisma/schema.prisma for
- * why the data model makes that possible; see below for how collisions are
- * translated into clean 409 / idempotent-replay responses.
+ * Invariants:
+ * 1. Poll voting: one vote per (poll, voter), idempotent retries, zero 5xx.
+ * 2. Shortlink: 20 concurrent /shorten of the same URL/alias -> exactly one
+ *    code wins, the rest resolve to it — no 500s, no duplicate codes.
  */
 
 function isUniqueViolation(e: unknown): e is Prisma.PrismaClientKnownRequestError {
@@ -46,6 +47,30 @@ const voteBody = z.object({
   idempotencyKey: z.string().min(1),
 });
 
+const shortenBody = z.object({
+  url: z.string().url(),
+  alias: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .regex(
+      /^[a-zA-Z0-9-_]+$/,
+      'alias must contain only alphanumeric characters, dashes, and underscores',
+    )
+    .optional(),
+});
+
+const BASE62_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+function generateRandomCode(length = 7): string {
+  const bytes = crypto.randomBytes(length);
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += BASE62_ALPHABET[bytes[i]! % BASE62_ALPHABET.length];
+  }
+  return result;
+}
+
 export function buildApp(): FastifyInstance {
   const app = Fastify({
     // Structured JSON logs with a per-request correlation id — the observability
@@ -77,10 +102,11 @@ export function buildApp(): FastifyInstance {
 
   // Minimal Prometheus-style metrics: enough for the observability bounty to build on.
   app.get('/metrics', async (_req, reply) => {
-    const [clones, polls, votes] = await Promise.all([
+    const [clones, polls, votes, shortlinks] = await Promise.all([
       prisma.clone.count(),
       prisma.poll.count(),
       prisma.vote.count(),
+      prisma.shortlink.count(),
     ]);
     reply.header('content-type', 'text/plain; version=0.0.4');
     return [
@@ -93,6 +119,9 @@ export function buildApp(): FastifyInstance {
       '# HELP openbuild_votes_total Number of votes recorded.',
       '# TYPE openbuild_votes_total counter',
       `openbuild_votes_total ${votes}`,
+      '# HELP openbuild_shortlinks_total Number of shortlinks created.',
+      '# TYPE openbuild_shortlinks_total counter',
+      `openbuild_shortlinks_total ${shortlinks}`,
       '',
     ].join('\n');
   });
@@ -194,6 +223,102 @@ export function buildApp(): FastifyInstance {
       );
       return reply.code(409).send({ error: 'already_voted' });
     }
+  });
+
+  // Shortlink clone: POST /shorten (url [+ optional alias]) -> { code, url }
+  // Deduplicates identical URLs/aliases. Invariant: 20 concurrent requests resolve
+  // to exactly one winning code, zero 5xx.
+  app.post('/shorten', async (req, reply) => {
+    const body = shortenBody.parse(req.body);
+    const hasAlias = Boolean(body.alias);
+    const lookupKey = hasAlias ? `alias:${body.alias}` : `url:${body.url}`;
+
+    const existing = await prisma.shortlink.findUnique({
+      where: { lookupKey },
+    });
+    if (existing) {
+      if (hasAlias && existing.url !== body.url) {
+        return reply.code(409).send({ error: 'alias_already_taken' });
+      }
+      req.log.info(
+        { event: 'shortlink.resolved_existing', code: existing.code, url: body.url },
+        'existing shortlink resolved',
+      );
+      return reply.code(200).send({
+        code: existing.code,
+        url: existing.url,
+      });
+    }
+
+    const code = hasAlias ? body.alias! : generateRandomCode(7);
+
+    try {
+      const created = await prisma.shortlink.create({
+        data: {
+          code,
+          url: body.url,
+          alias: body.alias ?? null,
+          lookupKey,
+        },
+      });
+      req.log.info(
+        { event: 'shortlink.created', code: created.code, url: created.url },
+        'shortlink created',
+      );
+      return reply.code(201).send({
+        code: created.code,
+        url: created.url,
+      });
+    } catch (e) {
+      if (!isUniqueViolation(e)) throw e;
+
+      // Unique constraint collision under concurrency race
+      const winner = await prisma.shortlink.findUnique({
+        where: { lookupKey },
+      });
+      if (winner) {
+        if (hasAlias && winner.url !== body.url) {
+          return reply.code(409).send({ error: 'alias_already_taken' });
+        }
+        req.log.info(
+          { event: 'shortlink.deduped_under_concurrency', code: winner.code, url: body.url },
+          'shortlink deduped under race',
+        );
+        return reply.code(200).send({
+          code: winner.code,
+          url: winner.url,
+        });
+      }
+
+      // If code collided (e.g. alias claimed by another URL)
+      const codeConflict = await prisma.shortlink.findUnique({
+        where: { code },
+      });
+      if (codeConflict) {
+        if (codeConflict.url === body.url) {
+          return reply.code(200).send({
+            code: codeConflict.code,
+            url: codeConflict.url,
+          });
+        }
+        return reply.code(409).send({ error: 'alias_already_taken' });
+      }
+
+      throw e;
+    }
+  });
+
+  // Shortlink redirect: GET /:code -> 307 Redirect
+  app.get('/:code', async (req, reply) => {
+    const { code } = req.params as { code: string };
+    const link = await prisma.shortlink.findUnique({
+      where: { code },
+    });
+    if (!link) {
+      return reply.code(404).send({ error: 'shortlink_not_found' });
+    }
+    req.log.info({ event: 'shortlink.redirected', code, url: link.url }, 'shortlink redirected');
+    return reply.code(307).redirect(link.url);
   });
 
   // Uniform 400 for validation failures so the probe never sees a spurious 500.
