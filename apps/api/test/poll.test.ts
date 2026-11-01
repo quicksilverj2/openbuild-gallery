@@ -1,12 +1,27 @@
+import { PassThrough } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app';
 import { prisma } from '../src/db';
 
 let app: FastifyInstance;
+const capturedLogs: Array<Record<string, unknown>> = [];
 
 beforeAll(async () => {
-  app = buildApp();
+  const logStream = new PassThrough();
+  logStream.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        capturedLogs.push(JSON.parse(trimmed));
+      } catch {
+        // ignore non-json lines
+      }
+    }
+  });
+
+  app = buildApp({ logStream });
   await app.ready();
   await prisma.clone.upsert({
     where: { slug: 'poll' },
@@ -31,8 +46,8 @@ async function newPoll(): Promise<{ pollId: string; optionA: string; optionB: st
   return { pollId: body.id, optionA: body.options[0].id, optionB: body.options[1].id };
 }
 
-function vote(pollId: string, payload: Record<string, string>) {
-  return app.inject({ method: 'POST', url: `/polls/${pollId}/votes`, payload });
+function vote(pollId: string, payload: Record<string, string>, headers?: Record<string, string>) {
+  return app.inject({ method: 'POST', url: `/polls/${pollId}/votes`, payload, headers });
 }
 
 function distribution(codes: number[]): Record<number, number> {
@@ -130,5 +145,48 @@ describe('invariant: distinct voters tally exactly', () => {
     const tally = (await app.inject({ method: 'GET', url: `/polls/${pollId}` })).json().tally;
     expect(tally.total).toBe(N);
     expect(tally.options[0].votes + tally.options[1].votes).toBe(N);
+  });
+});
+
+describe('observability: per-clone structured logs, correlation IDs, and /metrics', () => {
+  it('correlates invariant events by x-request-id and exposes per-clone counters on /metrics', async () => {
+    const { pollId, optionA } = await newPoll();
+    const winnerCorrelationId = 'corr-winner-001';
+    const loserCorrelationId = 'corr-loser-002';
+
+    const winRes = await vote(
+      pollId,
+      { optionId: optionA, voterId: 'obs-voter', idempotencyKey: 'obs-key-1' },
+      { 'x-request-id': winnerCorrelationId },
+    );
+    expect(winRes.statusCode).toBe(201);
+    expect(winRes.headers['x-request-id']).toBe(winnerCorrelationId);
+
+    const loseRes = await vote(
+      pollId,
+      { optionId: optionA, voterId: 'obs-voter', idempotencyKey: 'obs-key-2' },
+      { 'x-request-id': loserCorrelationId },
+    );
+    expect(loseRes.statusCode).toBe(409);
+    expect(loseRes.headers['x-request-id']).toBe(loserCorrelationId);
+
+    const alreadyVotedLog = capturedLogs.find(
+      (entry) =>
+        entry.reqId === loserCorrelationId &&
+        entry.event === 'vote.already_voted' &&
+        entry.cloneSlug === 'poll' &&
+        entry.invariant === 'race_lost',
+    );
+    expect(alreadyVotedLog).toBeDefined();
+
+    const metricsRes = await app.inject({ method: 'GET', url: '/metrics' });
+    expect(metricsRes.statusCode).toBe(200);
+    const body = metricsRes.body;
+    expect(body).toContain('openbuild_clone_polls_total{clone="poll"}');
+    expect(body).toContain('openbuild_clone_votes_total{clone="poll"}');
+    expect(body).toContain('openbuild_clone_requests_total{clone="poll",method="POST",status="201"}');
+    expect(body).toContain('openbuild_clone_requests_total{clone="poll",method="POST",status="409"}');
+    expect(body).toContain('openbuild_clone_invariant_events_total{clone="poll",event="vote.already_voted"}');
+    expect(body).toContain('openbuild_clone_invariant_events_total{clone="poll",event="race_lost"}');
   });
 });
